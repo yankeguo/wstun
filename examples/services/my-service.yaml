@@ -1,0 +1,17 @@
+# Service Definition File
+#
+# This file defines a service that can be exposed through wstun.
+# The filename (without .yaml extension) becomes the service name.
+# For example, this file "my-service.yaml" creates a service named "my-service".
+
+# service_token (required)
+# Authentication token that clients must provide to connect.
+# Generate a secure random token for production use.
+# Example: openssl rand -hex 32
+service_token: "your-secret-token-here"
+
+# listen_addr (required)
+# The address where this service will be exposed on the server.
+# Examples: ":9090", "0.0.0.0:9090", "127.0.0.1:9090"
+listen_addr: ":9090"
+

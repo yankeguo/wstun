@@ -8,10 +8,35 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ServiceDefinition represents a single service configuration on the server.
+type ServiceDefinition struct {
+	// ServiceToken is the authentication token for this service
+	ServiceToken string `yaml:"service_token"`
+
+	// ListenAddr is the address where this service will be exposed on the server
+	ListenAddr string `yaml:"listen_addr"`
+}
+
+// Validate checks if the ServiceDefinition is valid.
+func (s *ServiceDefinition) Validate() error {
+	if s.ServiceToken == "" {
+		return fmt.Errorf("service_token is required")
+	}
+
+	if s.ListenAddr == "" {
+		return fmt.Errorf("listen_addr is required")
+	}
+
+	return nil
+}
+
 // ServerOptions represents the configuration for the WebSocket tunnel server.
 type ServerOptions struct {
 	// ListenAddr is the address to bind the server (e.g., ":8080" or "0.0.0.0:8080")
 	ListenAddr string `yaml:"listen_addr"`
+
+	// ServicesDir is the directory containing service definition files
+	ServicesDir string `yaml:"services_dir"`
 
 	// TLSCert is the path to the TLS certificate file (optional)
 	TLSCert string `yaml:"tls_cert"`
@@ -30,6 +55,10 @@ type ServerOptions struct {
 func (o *ServerOptions) Validate() error {
 	if o.ListenAddr == "" {
 		return fmt.Errorf("listen_addr is required")
+	}
+
+	if o.ServicesDir == "" {
+		return fmt.Errorf("services_dir is required")
 	}
 
 	// If one TLS option is set, both must be set
@@ -74,8 +103,14 @@ type ClientOptions struct {
 	// ServerURL is the WebSocket server URL to connect to (required)
 	ServerURL string `yaml:"server_url"`
 
-	// LocalAddr is the local address to listen on for incoming connections (required)
-	LocalAddr string `yaml:"local_addr"`
+	// ServiceName is the name of the service to expose (required)
+	ServiceName string `yaml:"service_name"`
+
+	// ServiceToken is the authentication token for the service (required)
+	ServiceToken string `yaml:"service_token"`
+
+	// TargetAddr is the local service address to tunnel (required)
+	TargetAddr string `yaml:"target_addr"`
 
 	// TLSInsecure skips TLS certificate verification (optional, default: false)
 	TLSInsecure bool `yaml:"tls_insecure"`
@@ -96,8 +131,23 @@ func (o *ClientOptions) Validate() error {
 		return fmt.Errorf("server_url is required")
 	}
 
-	if o.LocalAddr == "" {
-		return fmt.Errorf("local_addr is required")
+	if o.ServiceName == "" {
+		return fmt.Errorf("service_name is required")
+	}
+
+	// Validate service name format (alphanumeric, hyphens, underscores only)
+	for _, r := range o.ServiceName {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return fmt.Errorf("service_name must contain only alphanumeric characters, hyphens, and underscores")
+		}
+	}
+
+	if o.ServiceToken == "" {
+		return fmt.Errorf("service_token is required")
+	}
+
+	if o.TargetAddr == "" {
+		return fmt.Errorf("target_addr is required")
 	}
 
 	// Validate log level
@@ -167,4 +217,85 @@ func LoadClientConfig(path string) (*ClientOptions, error) {
 	}
 
 	return &opts, nil
+}
+
+// LoadServiceDefinition loads and validates a ServiceDefinition from a YAML file.
+func LoadServiceDefinition(path string) (*ServiceDefinition, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read service definition file: %w", err)
+	}
+
+	var service ServiceDefinition
+	if err := yaml.Unmarshal(data, &service); err != nil {
+		return nil, fmt.Errorf("failed to parse service YAML: %w", err)
+	}
+
+	if err := service.Validate(); err != nil {
+		return nil, fmt.Errorf("service definition validation failed: %w", err)
+	}
+
+	return &service, nil
+}
+
+// LoadAllServices loads all service definitions from a directory.
+// Returns a map of service name (derived from filename) to ServiceDefinition.
+// Files must have .yaml or .yml extension.
+func LoadAllServices(servicesDir string) (map[string]*ServiceDefinition, error) {
+	// Check if directory exists
+	dirInfo, err := os.Stat(servicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("services directory not found: %w", err)
+	}
+	if !dirInfo.IsDir() {
+		return nil, fmt.Errorf("services_dir is not a directory: %s", servicesDir)
+	}
+
+	// Read directory entries
+	entries, err := os.ReadDir(servicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read services directory: %w", err)
+	}
+
+	services := make(map[string]*ServiceDefinition)
+	var loadErrors []string
+
+	for _, entry := range entries {
+		// Skip directories and non-YAML files
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		// Check for .yaml or .yml extension
+		if !(len(name) > 5 && name[len(name)-5:] == ".yaml") &&
+			!(len(name) > 4 && name[len(name)-4:] == ".yml") {
+			continue
+		}
+
+		// Derive service name from filename
+		var serviceName string
+		if len(name) > 5 && name[len(name)-5:] == ".yaml" {
+			serviceName = name[:len(name)-5]
+		} else {
+			serviceName = name[:len(name)-4]
+		}
+
+		// Load service definition
+		filePath := fmt.Sprintf("%s/%s", servicesDir, name)
+		service, err := LoadServiceDefinition(filePath)
+		if err != nil {
+			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+
+		services[serviceName] = service
+	}
+
+	// Report any load errors
+	if len(loadErrors) > 0 {
+		return services, fmt.Errorf("some service definitions failed to load: %v", loadErrors)
+	}
+
+	return services, nil
 }

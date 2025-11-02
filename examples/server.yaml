@@ -8,6 +8,13 @@
 # Examples: ":8080", "0.0.0.0:8080", "127.0.0.1:8080"
 listen_addr: ":8080"
 
+# services_dir (required)
+# Directory containing service definition files.
+# Each YAML file in this directory defines a service that clients can connect to.
+# The filename (without extension) becomes the service name.
+# Example: services_dir/my-service.yaml defines service "my-service"
+services_dir: "./services"
+
 # tls_cert (optional)
 # Path to the TLS certificate file.
 # If set, tls_key must also be set.
@@ -27,4 +34,3 @@ log_level: "info"
 # Maximum number of concurrent connections.
 # Set to 0 for unlimited connections.
 max_connections: 0
-

@@ -42,7 +42,8 @@ func main() {
 	logger := log.New(os.Stdout, logPrefix, log.LstdFlags)
 	logger.Printf("Starting client with config from: %s", *configPath)
 	logger.Printf("Server URL: %s", config.ServerURL)
-	logger.Printf("Local address: %s", config.LocalAddr)
+	logger.Printf("Service name: %s", config.ServiceName)
+	logger.Printf("Target address: %s", config.TargetAddr)
 	logger.Printf("Log level: %s", config.LogLevel)
 
 	if config.TLSInsecure {

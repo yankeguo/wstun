@@ -8,10 +8,22 @@
 # Examples: "ws://localhost:8080", "wss://tunnel.example.com"
 server_url: "ws://localhost:8080"
 
-# local_addr (required)
-# The local address to listen on for incoming connections.
-# Examples: ":9090", "127.0.0.1:9090"
-local_addr: ":9090"
+# service_name (required)
+# The name of the service to expose through the tunnel.
+# This must match a service definition on the server side.
+# Example: "my-service" corresponds to services/my-service.yaml on the server
+service_name: "my-service"
+
+# service_token (required)
+# Authentication token for this service.
+# This must match the service_token in the server's service definition file.
+service_token: "your-secret-token-here"
+
+# target_addr (required)
+# The local service address to tunnel through the WebSocket connection.
+# This is the address of the service running locally that you want to expose.
+# Examples: "127.0.0.1:3000", "localhost:8080", "192.168.1.100:5000"
+target_addr: "127.0.0.1:3000"
 
 # tls_insecure (optional, default: false)
 # Skip TLS certificate verification.
