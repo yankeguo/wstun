@@ -1,0 +1,30 @@
+# WebSocket Tunnel Server Configuration
+#
+# This is an example configuration file for wstun-server.
+# Copy this file and modify it to suit your needs.
+
+# listen_addr (required)
+# The address and port to bind the server to.
+# Examples: ":8080", "0.0.0.0:8080", "127.0.0.1:8080"
+listen_addr: ":8080"
+
+# tls_cert (optional)
+# Path to the TLS certificate file.
+# If set, tls_key must also be set.
+# tls_cert: "/path/to/cert.pem"
+
+# tls_key (optional)
+# Path to the TLS private key file.
+# If set, tls_cert must also be set.
+# tls_key: "/path/to/key.pem"
+
+# log_level (optional, default: "info")
+# Logging verbosity level.
+# Valid values: "debug", "info", "warn", "error"
+log_level: "info"
+
+# max_connections (optional, default: 0 = unlimited)
+# Maximum number of concurrent connections.
+# Set to 0 for unlimited connections.
+max_connections: 0
+
