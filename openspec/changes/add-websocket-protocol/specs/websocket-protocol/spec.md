@@ -15,6 +15,27 @@ The system SHALL define message type constants for WebSocket protocol communicat
 - **AND** HANDLE messages have format "HANDLE:[ULID]"
 - **AND** ULID is exactly 26 characters
 
+### Requirement: Authentication and Security Model
+The system SHALL require BasicAuth authentication for every WebSocket connection, with ULID used only for connection matching, not security.
+
+#### Scenario: Every connection requires BasicAuth
+- **WHEN** any WebSocket connection is established (control or data)
+- **THEN** BasicAuth with ServiceName and ServiceToken MUST be provided
+- **AND** server verifies credentials before accepting connection
+- **AND** connection is rejected if authentication fails
+
+#### Scenario: ULID is for matching not security
+- **WHEN** client sends HANDLE message with ULID
+- **THEN** ULID is used only to match connection to pending request
+- **AND** ULID does NOT provide authentication or authorization
+- **AND** BasicAuth is the sole authentication mechanism
+
+#### Scenario: Data connection authentication
+- **WHEN** client establishes data connection with HANDLE:[ULID]
+- **THEN** server verifies BasicAuth credentials independently
+- **AND** server does not rely on ULID for security validation
+- **AND** malicious actor cannot use intercepted ULID without valid credentials
+
 ### Requirement: Client Initial Connection Establishment
 The client SHALL establish an initial WebSocket connection to the server using BasicAuth credentials.
 
@@ -33,25 +54,65 @@ The client SHALL establish an initial WebSocket connection to the server using B
 - **THEN** client sends text message "WAITING" as the first message
 - **AND** message is sent as WebSocket text frame
 
+### Requirement: Server WebSocket Endpoint and Connection Routing
+The server SHALL provide a single path-agnostic WebSocket endpoint that handles both control and data connections, routing them based on the first text message received.
+
+#### Scenario: Single endpoint for all connections
+- **WHEN** server is configured
+- **THEN** server provides one WebSocket upgrade endpoint
+- **AND** both control and data connections use the same endpoint URL
+
+#### Scenario: Path-agnostic connection handling
+- **WHEN** client connects to server WebSocket endpoint
+- **THEN** server accepts connections on any URL path
+- **AND** URL path is ignored during connection handling
+- **AND** routing is based solely on first message content
+
+#### Scenario: First message determines connection type
+- **WHEN** server accepts a WebSocket connection
+- **THEN** server waits for and reads the first text message
+- **AND** routes to control handler if message is "WAITING"
+- **AND** routes to data handler if message starts with "HANDLE:"
+
+#### Scenario: Simplified server logic
+- **WHEN** implementing WebSocket handler
+- **THEN** server uses unified upgrade handler for all connections
+- **AND** single authentication check applies to all connections
+- **AND** first message routing eliminates need for separate endpoints
+
+#### Scenario: Invalid first message type
+- **WHEN** server receives first message that is not a text frame
+- **THEN** server closes the WebSocket connection with error
+- **AND** logs the invalid message type
+
+#### Scenario: Unrecognized first message content
+- **WHEN** server reads first text message that is neither "WAITING" nor starts with "HANDLE:"
+- **THEN** server closes the WebSocket connection with error
+- **AND** logs the unrecognized message content
+
 ### Requirement: Server Initial Connection Handling
 The server SHALL accept initial WebSocket connections and verify BasicAuth credentials against service definitions.
 
-#### Scenario: Successful authentication
+#### Scenario: Successful authentication on any connection
 - **WHEN** server receives connection with valid BasicAuth for a known service
 - **THEN** connection is accepted and upgraded to WebSocket
-- **AND** server stores the connection as available for the service
+- **AND** server waits for first text message to determine connection type
+- **AND** authentication is required for both control and data connections
 
 #### Scenario: Authentication with unknown service
 - **WHEN** server receives connection with ServiceName not in service definitions
 - **THEN** connection is rejected with 401 Unauthorized
+- **AND** connection is not upgraded to WebSocket
 
 #### Scenario: Authentication with invalid token
 - **WHEN** server receives connection with valid ServiceName but wrong ServiceToken
 - **THEN** connection is rejected with 401 Unauthorized
+- **AND** connection is not upgraded to WebSocket
 
-#### Scenario: WAITING message received
-- **WHEN** server receives "WAITING" text message on initial connection
-- **THEN** server marks the connection as ready to handle requests
+#### Scenario: WAITING message received as first message
+- **WHEN** server reads first text message and it equals "WAITING"
+- **THEN** server routes connection to control connection handler
+- **AND** marks the connection as ready to handle requests
 - **AND** connection remains open for future CONNECT messages
 
 ### Requirement: Server Connection Request Notification
@@ -81,24 +142,32 @@ The client SHALL establish new WebSocket connections to handle specific connecti
 - **THEN** client extracts ULID from the message
 - **AND** client initiates new WebSocket connection to server
 
-#### Scenario: Send HANDLE message
+#### Scenario: Send HANDLE message with authentication
 - **WHEN** client establishes new connection for handling a request
-- **THEN** client sends text message "HANDLE:[ULID]" as first message on new connection
+- **THEN** client MUST provide same BasicAuth credentials (ServiceName, ServiceToken)
+- **AND** client sends text message "HANDLE:[ULID]" as first message on new connection
 - **AND** message uses the ULID received in CONNECT message
 - **AND** message is sent as WebSocket text frame
-- **AND** uses same BasicAuth credentials as control connection
 
-#### Scenario: HANDLE authentication
+#### Scenario: HANDLE connection requires authentication
 - **WHEN** client opens new connection for HANDLE
-- **THEN** client uses same ServiceName and ServiceToken via BasicAuth
-- **AND** server verifies credentials before accepting HANDLE
+- **THEN** server verifies BasicAuth credentials before upgrade
+- **AND** server rejects connection if credentials are invalid
+- **AND** ULID alone is NOT sufficient for authentication
 
 ### Requirement: Server Data Connection Matching
 The server SHALL match incoming HANDLE connections to pending connection requests by ULID.
 
+#### Scenario: HANDLE received as first message
+- **WHEN** server reads first text message and it starts with "HANDLE:"
+- **THEN** server routes connection to data connection handler
+- **AND** extracts ULID from the message
+- **AND** security is already verified by BasicAuth, ULID is for matching only
+
 #### Scenario: Successful HANDLE match
-- **WHEN** server receives "HANDLE:[ULID]" on new connection
+- **WHEN** server receives "HANDLE:[ULID]" as first message on authenticated connection
 - **THEN** server looks up pending connection request with matching ULID
+- **AND** verifies ULID belongs to a service matching the authenticated ServiceName
 - **AND** associates new WebSocket with the pending request
 - **AND** connection is ready for bidirectional data transfer
 

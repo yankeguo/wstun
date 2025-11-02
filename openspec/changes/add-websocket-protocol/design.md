@@ -40,21 +40,25 @@ This design focuses on simplicity and testability, keeping the protocol layer in
 - Cryptographically strong randomness
 - 26-character string representation (URL-safe)
 - Single server instance friendly (no coordination needed)
+- **ULID is for connection matching only, NOT for security** - every connection requires BasicAuth
 
 **Alternatives considered**:
 - UUID v4: Not time-sortable, slightly longer string representation
 - Sequential integers: Requires coordination, predictable
 
-### Decision: BasicAuth for initial authentication
+### Decision: BasicAuth for every connection
 **Rationale**:
+- **Every WebSocket connection (control and data) requires BasicAuth verification**
 - Standard HTTP authentication mechanism
 - Well-supported by WebSocket libraries
 - Simple to implement and test
 - ServiceName as username, ServiceToken as password
+- Ensures security even if ULID is intercepted or guessed
 
 **Alternatives considered**:
 - Custom headers: Less standard, more implementation work
 - JWT tokens: Overkill for this use case, requires token management
+- ULID-based authentication: Insecure, ULID is for matching not security
 
 ### Decision: Two-connection model (control + data)
 **Rationale**:
@@ -73,17 +77,35 @@ This design focuses on simplicity and testability, keeping the protocol layer in
 - Server cannot initiate connections to client
 - Follows WebSocket's client-initiated model
 
+### Decision: Single WebSocket endpoint with first-message routing
+**Rationale**:
+- Server uses single WebSocket endpoint for both control and data connections
+- **Server does not distinguish by URL path** - client can connect to any path
+- First text message determines connection type: "WAITING" = control, "HANDLE:[ULID]" = data
+- Simplifies server implementation: one upgrade handler, read first message, route accordingly
+- Reduces configuration complexity (no need for separate endpoints)
+- Client always sends text message as first message on any connection
+- **Path-agnostic design enables gateway-level routing** - gateways can route to different server instances without protocol awareness
+
+**Alternatives considered**:
+- Separate WebSocket endpoints for control vs data: More configuration, harder to manage
+- Custom headers for connection type: Less flexible, harder to test
+- Query parameters: Exposes connection ID in URL (less clean)
+- Path-based routing: Requires gateway awareness of protocol details
+
 ## Protocol Flow
 
 ```
-Client                          Server
+Client                          Server (Single WebSocket Endpoint)
   |                               |
   | 1. Connect (BasicAuth)        |
   |------------------------------>|
   |                               | (Verify credentials)
-  |                               |
-  | 2. Send "WAITING"             |
+  |                               | (Wait for first text message)
+  | 2. Send "WAITING" (text)      |
   |------------------------------>|
+  |                               | (Read first message)
+  |                               | (Route: WAITING → control handler)
   |                               | (Mark client ready)
   |                               |
   |                     [Incoming request arrives]
@@ -93,9 +115,12 @@ Client                          Server
   |                               |
   | 4. New connection (BasicAuth) |
   |------------------------------>|
-  |                               |
-  | 5. Send "HANDLE:[ULID]"       |
+  |                               | (Verify credentials)
+  |                               | (Wait for first text message)
+  | 5. Send "HANDLE:[ULID]" (text)|
   |------------------------------>|
+  |                               | (Read first message)
+  |                               | (Route: HANDLE:[ULID] → data handler)
   |                               | (Match connection to request)
   |                               |
   | 6. Binary data exchange       |
@@ -123,16 +148,79 @@ wstun/
 └── protocol_test.go      # Protocol tests
 ```
 
+## Implementation Notes
+
+### Server WebSocket Handler Pattern
+
+The server implementation follows this pattern:
+
+```go
+func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+    // Note: URL path is ignored - any path is acceptable
+    
+    // 1. Verify BasicAuth (ServiceName, ServiceToken) - REQUIRED for every connection
+    serviceName, serviceToken := extractBasicAuth(r)
+    if !validateCredentials(serviceName, serviceToken) {
+        http.Error(w, "Unauthorized", 401)
+        return
+    }
+    
+    // 2. Upgrade to WebSocket
+    conn := upgrader.Upgrade(w, r)
+    
+    // 3. Read first text message (MUST be text frame)
+    messageType, message := conn.ReadMessage()
+    if messageType != websocket.TextMessage {
+        conn.Close()
+        return
+    }
+    
+    // 4. Route based on message content
+    if message == "WAITING" {
+        handleControlConnection(conn, serviceName)
+    } else if strings.HasPrefix(message, "HANDLE:") {
+        ulid := extractULID(message)
+        // Note: ULID is for matching only, security already verified by BasicAuth
+        handleDataConnection(conn, serviceName, ulid)
+    } else {
+        conn.Close() // Invalid first message
+    }
+}
+```
+
+### Client Connection Pattern
+
+Both control and data connections follow the same initialization:
+
+```go
+// Control connection - can connect to any path
+conn := dialWithBasicAuth(serverURL, serviceName, serviceToken)
+conn.WriteMessage(websocket.TextMessage, []byte("WAITING"))
+
+// Data connection - can connect to any path, MUST use same BasicAuth
+conn := dialWithBasicAuth(serverURL, serviceName, serviceToken)
+conn.WriteMessage(websocket.TextMessage, []byte("HANDLE:"+ulid))
+
+// Note: Both connections require BasicAuth for security
+// ULID is only used for matching data connection to pending request
+```
+
 ## Risks / Trade-offs
 
 ### Risk: Connection ID collision
 **Mitigation**: ULID provides 128-bit randomness component, collision probability is negligible for expected scale
+
+### Risk: ULID interception or prediction
+**Mitigation**: **Every connection requires BasicAuth authentication**. Even if attacker intercepts or predicts ULID, they cannot establish HANDLE connection without valid ServiceName and ServiceToken. ULID is explicitly designed as a matching mechanism, not a security token.
 
 ### Risk: Orphaned connections if client disappears
 **Mitigation**: WebSocket close events and timeouts (implementation detail for server)
 
 ### Risk: Control connection failure
 **Mitigation**: Client must detect and reconnect (outside protocol scope)
+
+### Risk: Path-agnostic endpoint exposed to public
+**Mitigation**: BasicAuth protects all connections. Server can optionally implement rate limiting or IP filtering at HTTP layer before WebSocket upgrade.
 
 ### Trade-off: Two connections per tunneled connection
 **Impact**: More WebSocket overhead, but simpler implementation and better separation of concerns. For expected use cases (dozens of concurrent connections), overhead is acceptable.
