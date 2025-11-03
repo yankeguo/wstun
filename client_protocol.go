@@ -111,15 +111,22 @@ func (cp *ClientProtocol) Stop() error {
 }
 
 func (cp *ClientProtocol) dial() (*websocket.Conn, error) {
-	// Parse server URL and add BasicAuth
+	// Parse server URL
 	u, err := url.Parse(cp.ServerURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server URL: %w", err)
 	}
 
-	// Create request header with BasicAuth
+	// Create request header with BasicAuth and Origin
 	header := http.Header{}
 	header.Set("Authorization", basicAuth(cp.ServiceName, cp.ServiceToken))
+
+	// Set Origin header inferred from WebSocket URL (ws->http, wss->https)
+	originScheme := "http"
+	if u.Scheme == "wss" {
+		originScheme = "https"
+	}
+	header.Set("Origin", originScheme+"://"+u.Host)
 
 	// Dial WebSocket (path-agnostic, server accepts any path)
 	conn, resp, err := cp.Dialer.Dial(u.String(), header)
