@@ -2,6 +2,7 @@ package wstun
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -268,48 +269,5 @@ func (cp *ClientProtocol) logf(format string, args ...interface{}) {
 // basicAuth creates a BasicAuth header value.
 func basicAuth(username, password string) string {
 	auth := username + ":" + password
-	return "Basic " + base64Encode(auth)
-}
-
-// base64Encode encodes a string to base64 (standard encoding).
-func base64Encode(s string) string {
-	const base64Table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	data := []byte(s)
-	n := len(data)
-	if n == 0 {
-		return ""
-	}
-
-	// Calculate output length
-	outLen := (n + 2) / 3 * 4
-	out := make([]byte, outLen)
-
-	si := 0
-	oi := 0
-	for si < n-2 {
-		val := uint32(data[si])<<16 | uint32(data[si+1])<<8 | uint32(data[si+2])
-		out[oi] = base64Table[(val>>18)&0x3F]
-		out[oi+1] = base64Table[(val>>12)&0x3F]
-		out[oi+2] = base64Table[(val>>6)&0x3F]
-		out[oi+3] = base64Table[val&0x3F]
-		si += 3
-		oi += 4
-	}
-
-	remain := n - si
-	if remain == 1 {
-		val := uint32(data[si]) << 16
-		out[oi] = base64Table[(val>>18)&0x3F]
-		out[oi+1] = base64Table[(val>>12)&0x3F]
-		out[oi+2] = '='
-		out[oi+3] = '='
-	} else if remain == 2 {
-		val := uint32(data[si])<<16 | uint32(data[si+1])<<8
-		out[oi] = base64Table[(val>>18)&0x3F]
-		out[oi+1] = base64Table[(val>>12)&0x3F]
-		out[oi+2] = base64Table[(val>>6)&0x3F]
-		out[oi+3] = '='
-	}
-
-	return string(out)
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
 }
