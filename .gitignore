@@ -33,3 +33,4 @@ go.work.sum
 
 /wstun-server
 /wstun-client
+/examples/client-debug.yaml
