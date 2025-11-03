@@ -1,0 +1,17 @@
+# Service Definition File - Service 1
+#
+# This file defines service-1 that exposes client-1's localhost:3000.
+# The filename (without .yaml extension) becomes the service name.
+
+# service_token (required)
+# Authentication token that clients must provide to connect.
+# This must match the service_token in client-1.yaml.
+# Generate a secure random token for production use.
+# Example: openssl rand -hex 32
+service_token: "your-secret-token-1-here"
+
+# listen_addr (required)
+# The address where this service will be exposed on the server.
+# Examples: ":9090", "0.0.0.0:9090", "127.0.0.1:9090"
+listen_addr: ":9090"
+

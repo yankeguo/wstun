@@ -1,0 +1,46 @@
+# WebSocket Tunnel Client Configuration - Service 2
+#
+# This is an example configuration file for wstun-client.
+# This client exposes localhost:3001 through the tunnel.
+
+# server_url (required)
+# The WebSocket server URL to connect to.
+# Examples: "ws://localhost:8080", "wss://tunnel.example.com"
+server_url: "ws://localhost:8080"
+
+# service_name (required)
+# The name of the service to expose through the tunnel.
+# This must match a service definition on the server side.
+# Example: "service-2" corresponds to services/service-2.yaml on the server
+service_name: "service-2"
+
+# service_token (required)
+# Authentication token for this service.
+# This must match the service_token in the server's service definition file.
+service_token: "your-secret-token-2-here"
+
+# target_addr (required)
+# The local service address to tunnel through the WebSocket connection.
+# This is the address of the service running locally that you want to expose.
+# Examples: "127.0.0.1:3000", "localhost:8080", "192.168.1.100:5000"
+target_addr: "127.0.0.1:3001"
+
+# tls_insecure (optional, default: false)
+# Skip TLS certificate verification.
+# WARNING: Only use this for testing! Never use in production.
+tls_insecure: true
+
+# reconnect_interval (optional, default: 5s)
+# Time to wait between reconnection attempts.
+# Examples: "5s", "10s", "1m"
+reconnect_interval: 5s
+
+# max_reconnect_attempts (optional, default: 0 = unlimited)
+# Maximum number of reconnection attempts.
+# Set to 0 for unlimited reconnection attempts.
+max_reconnect_attempts: 0
+
+# log_level (optional, default: "info")
+# Logging verbosity level.
+# Valid values: "debug", "info", "warn", "error"
+log_level: "info"
