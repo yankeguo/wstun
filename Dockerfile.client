@@ -1,0 +1,7 @@
+FROM debian:13-slim
+
+ADD wstun-client /usr/local/bin/wstun-client
+
+WORKDIR /wstun-client
+
+CMD ["wstun-client", "-c", "config.yaml"]

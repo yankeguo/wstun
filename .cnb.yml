@@ -1,0 +1,26 @@
+main:
+  push:
+    - docker:
+        image: golang:1.25.3-trixie
+      services:
+        - docker
+      stages:
+        - name: build server
+          script:
+            - go build -o wstun-server ./cmd/wstun-server
+        - name: build client
+          script:
+            - go build -o wstun-client ./cmd/wstun-client
+        - name: determine version
+          script:
+            - echo "$(git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)"
+          exports:
+            stdout: DOCKER_VERSION
+        - name: docker build server
+          script: docker build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:server-${DOCKER_VERSION} -f Dockerfile.server .
+        - name: docker push server
+          script: docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:server-${DOCKER_VERSION}
+        - name: docker build client
+          script: docker build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:client-${DOCKER_VERSION} -f Dockerfile.client .
+        - name: docker push client
+          script: docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:client-${DOCKER_VERSION}
