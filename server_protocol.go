@@ -73,6 +73,11 @@ type pendingConnection struct {
 	cancel      context.CancelFunc
 }
 
+type controlConnection struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
 // NewServerProtocol creates a new server protocol handler.
 func NewServerProtocol(authFunc ServiceAuthFunc) *ServerProtocol {
 	return &ServerProtocol{
@@ -199,7 +204,19 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 
 	// Delegate to handler
 	if sp.DataHandler != nil {
+		// Use defer/recover to catch panics in handler
+		defer func() {
+			if r := recover(); r != nil {
+				sp.logf("Panic in DataHandler for connection %s: %v", connID, r)
+				conn.Close()
+				pending.incoming.Close()
+			}
+		}()
 		sp.DataHandler(pending.incoming, conn)
+	} else {
+		sp.logf("No DataHandler configured, closing connection: %s", connID)
+		conn.Close()
+		pending.incoming.Close()
 	}
 }
 
@@ -248,7 +265,8 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 func (sp *ServerProtocol) registerControlConnection(serviceName string, conn *websocket.Conn) {
 	value, _ := sp.controlConns.LoadOrStore(serviceName, &sync.Map{})
 	conns := value.(*sync.Map)
-	conns.Store(conn, struct{}{})
+	cc := &controlConnection{conn: conn}
+	conns.Store(cc, struct{}{})
 }
 
 func (sp *ServerProtocol) unregisterControlConnection(serviceName string, conn *websocket.Conn) {
@@ -257,7 +275,15 @@ func (sp *ServerProtocol) unregisterControlConnection(serviceName string, conn *
 		return
 	}
 	conns := value.(*sync.Map)
-	conns.Delete(conn)
+	// Find and remove the control connection wrapper
+	conns.Range(func(key, _ interface{}) bool {
+		cc := key.(*controlConnection)
+		if cc.conn == conn {
+			conns.Delete(key)
+			return false // stop iteration
+		}
+		return true
+	})
 }
 
 func (sp *ServerProtocol) sendToControlConnections(serviceName string, message string) {
@@ -269,10 +295,15 @@ func (sp *ServerProtocol) sendToControlConnections(serviceName string, message s
 
 	conns := value.(*sync.Map)
 	conns.Range(func(key, _ interface{}) bool {
-		conn := key.(*websocket.Conn)
-		// Write synchronously to avoid concurrent write issues
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		cc := key.(*controlConnection)
+		// Use mutex to protect concurrent writes
+		cc.writeMu.Lock()
+		err := cc.conn.WriteMessage(websocket.TextMessage, []byte(message))
+		cc.writeMu.Unlock()
+
+		if err != nil {
 			sp.logf("Failed to send message to control connection: %v", err)
+			// Don't remove connection here as it might cause concurrent map modification
 		}
 		return true
 	})

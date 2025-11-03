@@ -2,7 +2,10 @@ package wstun
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -131,11 +134,35 @@ func (o *ClientOptions) Validate() error {
 		return fmt.Errorf("server_url is required")
 	}
 
+	// Validate server URL format and scheme
+	parsedURL, err := url.Parse(o.ServerURL)
+	if err != nil {
+		return fmt.Errorf("server_url is invalid: %w", err)
+	}
+	if parsedURL.Scheme != "ws" && parsedURL.Scheme != "wss" {
+		return fmt.Errorf("server_url must use ws:// or wss:// scheme, got: %s://", parsedURL.Scheme)
+	}
+
 	if o.ServiceName == "" {
 		return fmt.Errorf("service_name is required")
 	}
 
+	// Trim whitespace and validate service name is not empty after trimming
+	trimmedName := strings.TrimSpace(o.ServiceName)
+	if trimmedName == "" {
+		return fmt.Errorf("service_name cannot be empty or whitespace-only")
+	}
+
+	// Validate service name length
+	if len(o.ServiceName) > 255 {
+		return fmt.Errorf("service_name too long (max 255 characters, got %d)", len(o.ServiceName))
+	}
+
 	// Validate service name format (alphanumeric, hyphens, underscores only)
+	// Cannot start or end with hyphen
+	if strings.HasPrefix(o.ServiceName, "-") || strings.HasSuffix(o.ServiceName, "-") {
+		return fmt.Errorf("service_name cannot start or end with hyphen")
+	}
 	for _, r := range o.ServiceName {
 		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
 			return fmt.Errorf("service_name must contain only alphanumeric characters, hyphens, and underscores")
@@ -281,8 +308,8 @@ func LoadAllServices(servicesDir string) (map[string]*ServiceDefinition, error) 
 			serviceName = name[:len(name)-4]
 		}
 
-		// Load service definition
-		filePath := fmt.Sprintf("%s/%s", servicesDir, name)
+		// Load service definition using safe path construction
+		filePath := filepath.Join(servicesDir, name)
 		service, err := LoadServiceDefinition(filePath)
 		if err != nil {
 			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", name, err))

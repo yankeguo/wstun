@@ -252,6 +252,12 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 	// Incoming -> Outgoing (TCP -> WebSocket)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Printf("Panic in incoming->outgoing transfer: %v", r)
+			}
+		}()
+
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := incoming.Read(buf)
@@ -261,6 +267,12 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 				}
 				return
 			}
+
+			// Handle zero-length reads
+			if n <= 0 {
+				continue
+			}
+
 			if err := outgoing.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 				if shouldLog(s.config.LogLevel, "debug") {
 					s.logger.Printf("Outgoing write error: %v", err)
@@ -273,6 +285,12 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 	// Outgoing -> Incoming (WebSocket -> TCP)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Printf("Panic in outgoing->incoming transfer: %v", r)
+			}
+		}()
+
 		for {
 			messageType, data, err := outgoing.ReadMessage()
 			if err != nil {
@@ -287,6 +305,12 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 				}
 				continue
 			}
+
+			// Handle zero-length data
+			if len(data) == 0 {
+				continue
+			}
+
 			if _, err := incoming.Write(data); err != nil {
 				if shouldLog(s.config.LogLevel, "debug") {
 					s.logger.Printf("Incoming write error: %v", err)

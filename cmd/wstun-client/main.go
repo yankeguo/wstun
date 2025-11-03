@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,10 +20,11 @@ import (
 
 // Client encapsulates the client state and operations.
 type Client struct {
-	config   *wstun.ClientOptions
-	protocol *wstun.ClientProtocol
-	logger   *log.Logger
-	shutdown chan struct{}
+	config     *wstun.ClientOptions
+	protocol   *wstun.ClientProtocol
+	protocolMu sync.RWMutex // Protects protocol access
+	logger     *log.Logger
+	shutdown   chan struct{}
 }
 
 func main() {
@@ -84,6 +86,11 @@ func main() {
 	// Run client with reconnection logic in a goroutine
 	clientErr := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				clientErr <- fmt.Errorf("panic in client.Run(): %v", r)
+			}
+		}()
 		clientErr <- client.Run()
 	}()
 
@@ -124,7 +131,8 @@ func (c *Client) Run() error {
 		default:
 		}
 
-		// Create protocol instance
+		// Create protocol instance with mutex protection
+		c.protocolMu.Lock()
 		c.protocol = wstun.NewClientProtocol(
 			c.config.ServerURL,
 			c.config.ServiceName,
@@ -143,6 +151,7 @@ func (c *Client) Run() error {
 
 		// Set connect handler
 		c.protocol.ConnectHandler = c.handleConnect
+		c.protocolMu.Unlock()
 
 		// Start protocol (blocks until disconnect)
 		if shouldLog(c.config.LogLevel, "info") {
@@ -189,10 +198,13 @@ func (c *Client) Run() error {
 			// Continue to next attempt
 		}
 
-		// Exponential backoff with cap
-		delay = delay * 2
-		if delay > 60*time.Second {
+		// Exponential backoff with cap and overflow protection
+		newDelay := delay * 2
+		if newDelay < delay || newDelay > 60*time.Second {
+			// Overflow detected or exceeded cap
 			delay = 60 * time.Second
+		} else {
+			delay = newDelay
 		}
 	}
 }
@@ -224,8 +236,13 @@ func (c *Client) handleConnect(ctx context.Context, connID string) (io.ReadWrite
 func (c *Client) Shutdown() error {
 	close(c.shutdown)
 
-	if c.protocol != nil {
-		if err := c.protocol.Stop(); err != nil {
+	// Safely access protocol with read lock
+	c.protocolMu.RLock()
+	protocol := c.protocol
+	c.protocolMu.RUnlock()
+
+	if protocol != nil {
+		if err := protocol.Stop(); err != nil {
 			c.logger.Printf("Protocol stop error: %v", err)
 		}
 	}

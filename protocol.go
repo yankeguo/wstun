@@ -77,6 +77,9 @@ const (
 // ULID length in string representation.
 const ulidLength = 26
 
+// Maximum length for protocol messages to prevent memory exhaustion.
+const maxMessageLength = 1024
+
 // GenerateConnectionID generates a new ULID for connection identification.
 // ULID is used for connection matching only, NOT for security.
 func GenerateConnectionID() (string, error) {
@@ -100,11 +103,19 @@ func FormatHandleMessage(connID string) string {
 // ParseConnectMessage extracts the connection ID from a CONNECT message.
 // Returns the connection ID and true if valid, empty string and false otherwise.
 func ParseConnectMessage(message string) (string, bool) {
+	// Validate message length to prevent excessive memory usage
+	if len(message) > maxMessageLength {
+		return "", false
+	}
 	if !strings.HasPrefix(message, MessageTypePrefixConnect) {
 		return "", false
 	}
 	connID := message[len(MessageTypePrefixConnect):]
 	if len(connID) != ulidLength {
+		return "", false
+	}
+	// Validate the ULID is well-formed
+	if !ValidateConnectionID(connID) {
 		return "", false
 	}
 	return connID, true
@@ -113,11 +124,19 @@ func ParseConnectMessage(message string) (string, bool) {
 // ParseHandleMessage extracts the connection ID from a HANDLE message.
 // Returns the connection ID and true if valid, empty string and false otherwise.
 func ParseHandleMessage(message string) (string, bool) {
+	// Validate message length to prevent excessive memory usage
+	if len(message) > maxMessageLength {
+		return "", false
+	}
 	if !strings.HasPrefix(message, MessageTypePrefixHandle) {
 		return "", false
 	}
 	connID := message[len(MessageTypePrefixHandle):]
 	if len(connID) != ulidLength {
+		return "", false
+	}
+	// Validate the ULID is well-formed
+	if !ValidateConnectionID(connID) {
 		return "", false
 	}
 	return connID, true

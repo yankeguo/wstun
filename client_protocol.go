@@ -175,6 +175,13 @@ func (cp *ClientProtocol) listenControl(conn *websocket.Conn) error {
 }
 
 func (cp *ClientProtocol) handleConnectRequest(connID string) {
+	// Use defer/recover to catch panics
+	defer func() {
+		if r := recover(); r != nil {
+			cp.logf("Panic in handleConnectRequest for %s: %v", connID, r)
+		}
+	}()
+
 	if cp.ConnectHandler == nil {
 		cp.logf("No ConnectHandler configured, ignoring request")
 		return
@@ -188,6 +195,10 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 	target, err := cp.ConnectHandler(ctx, connID)
 	if err != nil {
 		cp.logf("Failed to connect to target for %s: %v", connID, err)
+		return
+	}
+	if target == nil {
+		cp.logf("ConnectHandler returned nil connection for %s", connID)
 		return
 	}
 	defer target.Close()
@@ -221,6 +232,12 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 	go func() {
 		defer wg.Done()
 		defer target.Close()
+		defer func() {
+			if r := recover(); r != nil {
+				cp.logf("[%s] Panic in WebSocket->Target transfer: %v", connID, r)
+			}
+		}()
+
 		for {
 			messageType, data, err := ws.ReadMessage()
 			if err != nil {
@@ -235,6 +252,11 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 				continue
 			}
 
+			// Handle zero-length data
+			if len(data) == 0 {
+				continue
+			}
+
 			if _, err := target.Write(data); err != nil {
 				cp.logf("[%s] Target write error: %v", connID, err)
 				return
@@ -246,6 +268,12 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 	go func() {
 		defer wg.Done()
 		defer ws.Close()
+		defer func() {
+			if r := recover(); r != nil {
+				cp.logf("[%s] Panic in Target->WebSocket transfer: %v", connID, r)
+			}
+		}()
+
 		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
 			n, err := target.Read(buf)
@@ -254,6 +282,11 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 					cp.logf("[%s] Target read error: %v", connID, err)
 				}
 				return
+			}
+
+			// Handle zero-length reads
+			if n <= 0 {
+				continue
 			}
 
 			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
