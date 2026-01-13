@@ -40,7 +40,7 @@ main:
             - go build -o wstun-client ./cmd/wstun-client
         - name: determine version
           script:
-            - echo "$(git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)"
+            - echo "latest"
           exports:
             stdout: DOCKER_VERSION
         - name: docker build server
