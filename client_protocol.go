@@ -226,12 +226,34 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 // transfer performs bidirectional data transfer between WebSocket and target connection.
 func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser, connID string) {
 	var wg sync.WaitGroup
+	var closeChOnce sync.Once
+	var closeWSOnce sync.Once
+	closeCh := make(chan struct{})
+
+	// signalClose signals both goroutines to stop
+	signalClose := func() {
+		closeChOnce.Do(func() {
+			close(closeCh)
+		})
+	}
+
+	// closeWebSocket gracefully closes the WebSocket connection
+	closeWebSocket := func() {
+		closeWSOnce.Do(func() {
+			ws.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+				time.Now().Add(time.Second))
+			ws.Close()
+		})
+	}
+
 	wg.Add(2)
 
 	// WebSocket -> Target
 	go func() {
 		defer wg.Done()
 		defer target.Close()
+		defer signalClose()
 		defer func() {
 			if r := recover(); r != nil {
 				cp.logf("[%s] Panic in WebSocket->Target transfer: %v", connID, r)
@@ -239,6 +261,12 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 		}()
 
 		for {
+			select {
+			case <-closeCh:
+				return
+			default:
+			}
+
 			messageType, data, err := ws.ReadMessage()
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
@@ -267,7 +295,8 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 	// Target -> WebSocket
 	go func() {
 		defer wg.Done()
-		defer ws.Close()
+		defer closeWebSocket()
+		defer signalClose()
 		defer func() {
 			if r := recover(); r != nil {
 				cp.logf("[%s] Panic in Target->WebSocket transfer: %v", connID, r)
@@ -276,6 +305,12 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 
 		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
+			select {
+			case <-closeCh:
+				return
+			default:
+			}
+
 			n, err := target.Read(buf)
 			if err != nil {
 				if err != io.EOF {
