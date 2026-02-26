@@ -641,14 +641,18 @@ func TestRequestConnectionRetryExhausted(t *testing.T) {
 	_, err := sp.RequestConnection("test-service", incomingServer)
 	elapsed := time.Since(start)
 
-	// Should return error after timeout (no retry despite RetryAttempts > 0)
+	// Should return error after all retry attempts are exhausted
 	if err == nil {
 		t.Fatal("Expected error after timeout, got nil")
 	}
 
-	// Should take approximately PendingTimeout (100ms) + small overhead (not multiple retries)
-	if elapsed < 80*time.Millisecond || elapsed > 200*time.Millisecond {
-		t.Errorf("Expected ~100ms for single timeout, got %v", elapsed)
+	// With RetryAttempts=2, PendingTimeout=100ms, RetryInterval=50ms:
+	//   attempt 0: 100ms wait + 50ms backoff
+	//   attempt 1: 100ms wait + 100ms backoff
+	//   attempt 2: 100ms wait → exhausted
+	// Total ≈ 450ms; allow generous range for slow CI machines.
+	if elapsed < 350*time.Millisecond || elapsed > 800*time.Millisecond {
+		t.Errorf("Expected ~450ms for 3 timeout attempts, got %v", elapsed)
 	}
 
 	// Connection should be closed

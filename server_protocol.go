@@ -233,20 +233,18 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 }
 
 // RequestConnection notifies a client about an incoming connection request.
-// Returns the connection ID and a channel to wait for the data connection.
-// The incoming connection should be provided and will be paired with the client's HANDLE connection.
+// It sends a CONNECT:[ULID] message over the control connection and waits for the client
+// to establish a matching data connection. Supports exponential-backoff retry when
+// RetryAttempts > 0. Closes incoming and returns an error when all attempts are exhausted.
 func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.ReadWriteCloser) (string, error) {
-	// Generate connection ID
+	// Generate connection ID (same ULID is reused across all retry attempts)
 	connID, err := GenerateConnectionID()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate connection ID: %w", err)
 	}
 
-	// Attempt connection with retry logic
-	attempt := 0
-
-	for {
-		// Create pending connection with timeout context
+	for attempt := 0; ; attempt++ {
+		// Create a fresh timeout context for each attempt
 		ctx, cancel := context.WithTimeout(context.Background(), sp.PendingTimeout)
 		pending := &pendingConnection{
 			serviceName: serviceName,
@@ -257,25 +255,21 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 
 		sp.pendingConns.Store(connID, pending)
 
-		// Start timeout handler
+		// Timeout goroutine: only removes the pending entry; incoming is NOT closed
+		// here so that retry attempts can reuse the same connection.
 		timeoutChan := make(chan bool, 1)
 		go func() {
 			<-ctx.Done()
 			timedOut := ctx.Err() == context.DeadlineExceeded
 			if timedOut {
-				// Timeout occurred, atomically remove and close pending connection
-				if value, loaded := sp.pendingConns.LoadAndDelete(connID); loaded {
-					pending := value.(*pendingConnection)
-					pending.incoming.Close()
-					sp.logf("Connection timeout, closed pending connection: %s", connID)
-				}
+				sp.pendingConns.Delete(connID)
+				sp.logf("Connection timeout for pending connection: %s", connID)
 			}
 			timeoutChan <- timedOut
 		}()
 
-		// Send CONNECT message to control connections for this service
-		message := FormatConnectMessage(connID)
-		sp.sendToControlConnections(serviceName, message)
+		// Send CONNECT message to all control connections for this service
+		sp.sendToControlConnections(serviceName, FormatConnectMessage(connID))
 
 		if attempt == 0 {
 			sp.logf("Connection request sent to service %s with ID: %s", serviceName, connID)
@@ -283,23 +277,32 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			sp.logf("Retrying connection request for service %s with ID: %s (attempt %d/%d)", serviceName, connID, attempt, sp.RetryAttempts)
 		}
 
-		// Wait for timeout or success
+		// Wait for the data connection handler to cancel the context (success)
+		// or for the deadline to fire (timeout).
 		timedOut := <-timeoutChan
 
 		if !timedOut {
-			// Connection was successful (cancelled by data connection handler)
+			// Data connection was successfully matched
 			return connID, nil
 		}
 
-		// Timeout occurred, incoming connection is already closed by timeout goroutine
-		// Check if we should retry
+		// Timeout – all retry attempts used up; close the incoming connection.
 		if attempt >= sp.RetryAttempts {
-			return "", fmt.Errorf("connection request failed after %d attempts", attempt+1)
+			incoming.Close()
+			return "", fmt.Errorf("connection request failed after %d attempt(s)", attempt+1)
 		}
 
-		// Cannot retry with closed incoming connection, fail immediately
-		sp.logf("Connection timeout for ID: %s, cannot retry (incoming closed)", connID)
-		return "", fmt.Errorf("connection request timed out for ID: %s", connID)
+		// Compute exponential backoff: RetryInterval * 2^attempt, capped at RetryMaxInterval
+		retryDelay := sp.RetryInterval
+		for i := 0; i < attempt; i++ {
+			retryDelay *= 2
+			if retryDelay > sp.RetryMaxInterval {
+				retryDelay = sp.RetryMaxInterval
+				break
+			}
+		}
+		sp.logf("Waiting %v before retry %d/%d for connection %s", retryDelay, attempt+1, sp.RetryAttempts, connID)
+		time.Sleep(retryDelay)
 	}
 }
 

@@ -122,6 +122,11 @@ max_reconnect_attempts: 0
 
 # 日志级别（可选，默认: "info"）
 log_level: "info"
+
+# WebSocket 心跳配置（可选）
+ping_interval: 30s # Ping 发送间隔（默认: 30s）
+pong_timeout: 60s # 等待 Pong 回应超时（默认: 60s）
+write_timeout: 10s # 写操作超时（默认: 10s）
 ```
 
 ### 5. 启动客户端
@@ -134,17 +139,17 @@ log_level: "info"
 
 ### 服务器配置
 
-| 字段                  | 类型     | 必填 | 默认值    | 说明                                                  |
-| --------------------- | -------- | ---- | --------- | ----------------------------------------------------- |
-| `listen_addr`         | string   | ✅   | -         | 服务器监听地址，例如 `:8080`                          |
-| `services_dir`        | string   | ✅   | -         | 服务定义文件目录路径                                  |
-| `tls_cert`            | string   | ❌   | -         | TLS 证书文件路径                                      |
-| `tls_key`             | string   | ❌   | -         | TLS 私钥文件路径                                      |
-| `log_level`           | string   | ❌   | `"info"`  | 日志级别：`debug`/`info`/`warn`/`error`               |
-| `max_connections`     | int      | ❌   | `0`       | 最大并发连接数（0 = 无限制）                          |
-| `retry_attempts`      | int      | ❌   | `0`       | 连接请求最大重试次数（0 = 不重试）                    |
-| `retry_interval`      | duration | ❌   | `5s`      | 初始重试间隔                                          |
-| `retry_max_interval`  | duration | ❌   | `60s`     | 最大重试间隔（指数退避上限）                          |
+| 字段                 | 类型     | 必填 | 默认值   | 说明                                    |
+| -------------------- | -------- | ---- | -------- | --------------------------------------- |
+| `listen_addr`        | string   | ✅   | -        | 服务器监听地址，例如 `:8080`            |
+| `services_dir`       | string   | ✅   | -        | 服务定义文件目录路径                    |
+| `tls_cert`           | string   | ❌   | -        | TLS 证书文件路径                        |
+| `tls_key`            | string   | ❌   | -        | TLS 私钥文件路径                        |
+| `log_level`          | string   | ❌   | `"info"` | 日志级别：`debug`/`info`/`warn`/`error` |
+| `max_connections`    | int      | ❌   | `0`      | 最大并发连接数（0 = 无限制）            |
+| `retry_attempts`     | int      | ❌   | `0`      | 连接请求最大重试次数（0 = 不重试）      |
+| `retry_interval`     | duration | ❌   | `5s`     | 初始重试间隔                            |
+| `retry_max_interval` | duration | ❌   | `60s`    | 最大重试间隔（指数退避上限）            |
 
 ### 客户端配置
 
@@ -158,6 +163,9 @@ log_level: "info"
 | `reconnect_interval`     | duration | ❌   | `5s`     | 重连间隔                                            |
 | `max_reconnect_attempts` | int      | ❌   | `0`      | 最大重连次数（0 = 无限制）                          |
 | `log_level`              | string   | ❌   | `"info"` | 日志级别：`debug`/`info`/`warn`/`error`             |
+| `ping_interval`          | duration | ❌   | `30s`    | WebSocket Ping 发送间隔                             |
+| `pong_timeout`           | duration | ❌   | `60s`    | 等待 Pong 回应的超时时间，超时则关闭连接            |
+| `write_timeout`          | duration | ❌   | `10s`    | WebSocket 写操作超时时间                            |
 
 ### 服务定义
 
@@ -212,7 +220,7 @@ log_level: "info"
 
 现在访问 `http://your-server.com:9000` 即可访问本地的 HTTP 服务。
 
-### 示例 4：启用服务器重试机制
+### 示例 2：启用服务器重试机制
 
 **场景**：在不稳定的网络环境下，启用服务器重试机制提高连接可靠性。
 
@@ -224,17 +232,17 @@ services_dir: "./services"
 log_level: "info"
 
 # 服务器重试配置（可选）
-retry_attempts: 3          # 连接请求失败时最多重试3次
-retry_interval: 5s         # 初始重试间隔5秒
-retry_max_interval: 60s    # 最大重试间隔60秒（指数退避上限）
+retry_attempts: 3 # 连接请求失败时最多重试3次
+retry_interval: 5s # 初始重试间隔5秒
+retry_max_interval: 60s # 最大重试间隔60秒（指数退避上限）
 ```
 
 **重试工作原理**：
 
-- 当客户端未在超时时间内建立数据连接时，服务器会自动重试
+- 当客户端未在超时时间内建立数据连接时，服务器会自动重试发送 `CONNECT:[ULID]`
 - 重试间隔采用指数退避策略：5s → 10s → 20s → 60s（上限）
-- 所有重试使用相同的连接ID（ULID），确保客户端正确处理
-- 重试耗尽后，服务器关闭外部TCP连接并返回错误
+- 所有重试使用**相同的连接 ID（ULID）**，外部 TCP 连接在整个重试周期内保持打开
+- 重试耗尽后，服务器才关闭外部 TCP 连接并返回错误
 
 **使用建议**：
 
@@ -243,7 +251,7 @@ retry_max_interval: 60s    # 最大重试间隔60秒（指数退避上限）
 - **合理配置**：根据客户端实际响应时间调整 `retry_interval` 和 `retry_max_interval`
 - **向后兼容**：启用重试不会破坏与旧版本客户端的兼容性
 
-### 示例 2：TLS/SSL 加密传输
+### 示例 3：TLS/SSL 加密传输
 
 1. **生成自签名证书**（测试用）:
 
@@ -272,7 +280,7 @@ tls_insecure: true # 仅用于自签名证书测试
 log_level: "info"
 ```
 
-### 示例 3：多服务配置
+### 示例 4：多服务配置
 
 一个服务器可以管理多个服务：
 
@@ -313,7 +321,6 @@ target_addr: "localhost:5432"
 wstun 使用双连接模型：
 
 1. **控制连接**（Control Connection）
-
    - 长连接，用于协调和命令传输
    - 客户端发送 `WAITING` 消息表示就绪
    - 服务器发送 `CONNECT:[ULID]` 通知新连接
@@ -586,6 +593,15 @@ log_level: "debug"
 感谢所有贡献者和使用 wstun 的用户！
 
 ## 更新日志
+
+### v1.1.0 (2026-02-26)
+
+- ✅ 服务器连接请求重试机制（指数退避，可配置次数）
+- ✅ 修复重试逻辑：外部 TCP 连接在所有重试耗尽前不再提前关闭
+- ✅ `ClientOptions` 补充字段注释（`ping_interval`、`pong_timeout`、`write_timeout`）
+- ✅ `LoadAllServices` 简化文件扩展名处理（使用 `filepath.Ext`）
+- ✅ 修复 `cmd` 中无意义的 `fmt.Sprintf` 调用
+- ✅ 修复 README 示例编号顺序，补充客户端配置表缺失字段
 
 ### v1.0.0 (2025-11-03)
 

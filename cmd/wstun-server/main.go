@@ -60,7 +60,7 @@ func main() {
 	}
 
 	// Configure logger based on log level
-	logPrefix := fmt.Sprintf("[wstun-server] ")
+	logPrefix := "[wstun-server] "
 	logger := log.New(os.Stdout, logPrefix, log.LstdFlags)
 	logger.Printf("Starting server with config from: %s", *configPath)
 	logger.Printf("Listen address: %s", config.ListenAddr)

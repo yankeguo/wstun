@@ -11,6 +11,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// validLogLevels is the shared set of accepted log level strings.
+var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+
 // ServiceDefinition represents a single service configuration on the server.
 type ServiceDefinition struct {
 	// ServiceToken is the authentication token for this service
@@ -91,7 +94,6 @@ func (o *ServerOptions) Validate() error {
 	}
 
 	// Validate log level
-	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if o.LogLevel != "" && !validLogLevels[o.LogLevel] {
 		return fmt.Errorf("log_level must be one of: debug, info, warn, error")
 	}
@@ -128,18 +130,40 @@ func (o *ServerOptions) SetDefaults() {
 	}
 }
 
+// ClientOptions represents the configuration for the WebSocket tunnel client.
 type ClientOptions struct {
-	ServerURL            string        `yaml:"server_url"`
-	ServiceName          string        `yaml:"service_name"`
-	ServiceToken         string        `yaml:"service_token"`
-	TargetAddr           string        `yaml:"target_addr"`
-	TLSInsecure          bool          `yaml:"tls_insecure"`
-	ReconnectInterval    time.Duration `yaml:"reconnect_interval"`
-	MaxReconnectAttempts int           `yaml:"max_reconnect_attempts"`
-	LogLevel             string        `yaml:"log_level"`
-	PingInterval         time.Duration `yaml:"ping_interval"`
-	PongTimeout          time.Duration `yaml:"pong_timeout"`
-	WriteTimeout         time.Duration `yaml:"write_timeout"`
+	// ServerURL is the WebSocket server URL (must use ws:// or wss:// scheme)
+	ServerURL string `yaml:"server_url"`
+
+	// ServiceName is the name that identifies this client's service on the server
+	ServiceName string `yaml:"service_name"`
+
+	// ServiceToken is the authentication token shared with the server service definition
+	ServiceToken string `yaml:"service_token"`
+
+	// TargetAddr is the local TCP address to forward connections to
+	TargetAddr string `yaml:"target_addr"`
+
+	// TLSInsecure disables TLS certificate verification (use only for testing)
+	TLSInsecure bool `yaml:"tls_insecure"`
+
+	// ReconnectInterval is the base delay between reconnection attempts (default: 5s)
+	ReconnectInterval time.Duration `yaml:"reconnect_interval"`
+
+	// MaxReconnectAttempts is the maximum number of reconnection attempts (0 = unlimited)
+	MaxReconnectAttempts int `yaml:"max_reconnect_attempts"`
+
+	// LogLevel specifies logging verbosity (optional, default: "info")
+	LogLevel string `yaml:"log_level"`
+
+	// PingInterval is how often to send WebSocket pings (default: 30s)
+	PingInterval time.Duration `yaml:"ping_interval"`
+
+	// PongTimeout is how long to wait for a pong before treating the connection as dead (default: 60s)
+	PongTimeout time.Duration `yaml:"pong_timeout"`
+
+	// WriteTimeout is the deadline for WebSocket write operations (default: 10s)
+	WriteTimeout time.Duration `yaml:"write_timeout"`
 }
 
 // Validate checks if the ClientOptions configuration is valid.
@@ -192,7 +216,6 @@ func (o *ClientOptions) Validate() error {
 	}
 
 	// Validate log level
-	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if o.LogLevel != "" && !validLogLevels[o.LogLevel] {
 		return fmt.Errorf("log_level must be one of: debug, info, warn, error")
 	}
@@ -224,6 +247,7 @@ func (o *ClientOptions) Validate() error {
 	return nil
 }
 
+// SetDefaults applies default values to optional fields.
 func (o *ClientOptions) SetDefaults() {
 	if o.LogLevel == "" {
 		o.LogLevel = "info"
@@ -332,19 +356,14 @@ func LoadAllServices(servicesDir string) (map[string]*ServiceDefinition, error) 
 		}
 
 		name := entry.Name()
-		// Check for .yaml or .yml extension
-		if !(len(name) > 5 && name[len(name)-5:] == ".yaml") &&
-			!(len(name) > 4 && name[len(name)-4:] == ".yml") {
+		// Only process .yaml / .yml files
+		ext := filepath.Ext(name)
+		if ext != ".yaml" && ext != ".yml" {
 			continue
 		}
 
-		// Derive service name from filename
-		var serviceName string
-		if len(name) > 5 && name[len(name)-5:] == ".yaml" {
-			serviceName = name[:len(name)-5]
-		} else {
-			serviceName = name[:len(name)-4]
-		}
+		// Derive service name by stripping the extension
+		serviceName := strings.TrimSuffix(name, ext)
 
 		// Load service definition using safe path construction
 		filePath := filepath.Join(servicesDir, name)
