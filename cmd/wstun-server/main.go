@@ -76,6 +76,12 @@ func main() {
 		logger.Printf("Max connections: unlimited")
 	}
 
+	if config.RetryAttempts > 0 {
+		logger.Printf("Retry attempts: %d", config.RetryAttempts)
+		logger.Printf("Retry interval: %v", config.RetryInterval)
+		logger.Printf("Retry max interval: %v", config.RetryMaxInterval)
+	}
+
 	// Create and start server
 	server, err := NewServer(config, logger)
 	if err != nil {
@@ -137,6 +143,9 @@ func NewServer(config *wstun.ServerOptions, logger *log.Logger) (*Server, error)
 	server.protocol = wstun.NewServerProtocol(authFunc)
 	server.protocol.Logger = logger
 	server.protocol.DataHandler = server.handleDataConnection
+	server.protocol.RetryAttempts = config.RetryAttempts
+	server.protocol.RetryInterval = config.RetryInterval
+	server.protocol.RetryMaxInterval = config.RetryMaxInterval
 
 	return server, nil
 }

@@ -1,0 +1,51 @@
+# Server Configuration with Retry Example
+# This example shows how to configure server-side retry for connection requests
+
+# Server listen address (required)
+listen_addr: ":8080"
+
+# Services directory (required)
+services_dir: "./services"
+
+# Log level (optional, default: "info")
+log_level: "info"
+
+# Maximum connections (optional, 0 = unlimited)
+max_connections: 100
+
+# Retry Configuration
+# Enable retry to handle transient client connection failures
+
+# Maximum number of retry attempts for connection requests (optional, default: 0)
+# Set to 0 to disable retry (default behavior)
+retry_attempts: 3
+
+# Initial retry interval (optional, default: 5s)
+# The first retry will wait this duration before attempting again
+retry_interval: 5s
+
+# Maximum retry interval (optional, default: 60s)
+# Retry intervals double each attempt (exponential backoff) until capped at this value
+retry_max_interval: 60s
+
+# Retry Behavior Example:
+# With retry_attempts: 3, retry_interval: 5s, retry_max_interval: 60s:
+# - Attempt 1: Original request, wait 30s (PendingTimeout)
+#   If timeout: wait 5s, then retry
+# - Attempt 2: Retry 1, wait 30s
+#   If timeout: wait 10s (5s * 2), then retry
+# - Attempt 3: Retry 2, wait 30s
+#   If timeout: wait 20s (10s * 2), then retry
+# - Attempt 4: Retry 3, wait 30s
+#   If timeout: connection fails, close external TCP connection
+#
+# Total maximum time for a connection with 3 retries:
+# 30s + 5s + 30s + 10s + 30s + 20s + 30s = 155s (~2.6 minutes)
+
+# Alternative: Disable retry (default behavior)
+# Uncomment these lines to disable retry:
+# retry_attempts: 0
+
+# TLS Configuration (optional)
+# tls_cert: "/path/to/cert.pem"
+# tls_key: "/path/to/key.pem"

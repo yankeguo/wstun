@@ -52,6 +52,15 @@ type ServerOptions struct {
 
 	// MaxConnections is the maximum number of concurrent connections (optional, 0 = unlimited)
 	MaxConnections int `yaml:"max_connections"`
+
+	// RetryAttempts is the maximum number of retry attempts for connection requests (optional, 0 = no retry)
+	RetryAttempts int `yaml:"retry_attempts"`
+
+	// RetryInterval is the initial retry interval (optional, default: 5s)
+	RetryInterval time.Duration `yaml:"retry_interval"`
+
+	// RetryMaxInterval is the maximum retry interval (optional, default: 60s)
+	RetryMaxInterval time.Duration `yaml:"retry_max_interval"`
 }
 
 // Validate checks if the ServerOptions configuration is valid.
@@ -91,6 +100,18 @@ func (o *ServerOptions) Validate() error {
 		return fmt.Errorf("max_connections must be >= 0")
 	}
 
+	if o.RetryAttempts < 0 {
+		return fmt.Errorf("retry_attempts must be >= 0")
+	}
+
+	if o.RetryInterval < 0 {
+		return fmt.Errorf("retry_interval must be >= 0")
+	}
+
+	if o.RetryMaxInterval < 0 {
+		return fmt.Errorf("retry_max_interval must be >= 0")
+	}
+
 	return nil
 }
 
@@ -98,6 +119,12 @@ func (o *ServerOptions) Validate() error {
 func (o *ServerOptions) SetDefaults() {
 	if o.LogLevel == "" {
 		o.LogLevel = "info"
+	}
+	if o.RetryInterval == 0 {
+		o.RetryInterval = 5 * time.Second
+	}
+	if o.RetryMaxInterval == 0 {
+		o.RetryMaxInterval = 60 * time.Second
 	}
 }
 

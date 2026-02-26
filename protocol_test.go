@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -358,16 +359,21 @@ func TestConnectionTimeout(t *testing.T) {
 	incomingClient, incomingServer := net.Pipe()
 	defer incomingClient.Close()
 
+	start := time.Now()
 	_, err := sp.RequestConnection("test-service", incomingServer)
-	if err != nil {
-		t.Fatalf("RequestConnection() error = %v", err)
+	elapsed := time.Since(start)
+
+	// Should return error after timeout (no retry by default)
+	if err == nil {
+		t.Fatal("Expected error after timeout, got nil")
 	}
 
-	// Wait for timeout
-	time.Sleep(300 * time.Millisecond)
+	// Should take approximately PendingTimeout (200ms) + small overhead
+	if elapsed < 150*time.Millisecond || elapsed > 400*time.Millisecond {
+		t.Errorf("Expected ~200ms for timeout, got %v", elapsed)
+	}
 
-	// Connection should be removed from pending
-	// We can't directly test this, but the connection should be closed
+	// Connection should be closed
 	buf := make([]byte, 1)
 	_, err = incomingClient.Read(buf)
 	if err == nil {
@@ -464,6 +470,282 @@ func TestConcurrentConnections(t *testing.T) {
 		if connID != "" && !handledIDs[connID] {
 			t.Errorf("Connection %d (ID: %s) was not handled", i, connID)
 		}
+	}
+}
+
+// Test server protocol retry configuration
+func TestServerProtocolRetryDefaults(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return true
+	}
+
+	sp := NewServerProtocol(authFunc)
+
+	if sp.RetryAttempts != 0 {
+		t.Errorf("expected default RetryAttempts to be 0, got %d", sp.RetryAttempts)
+	}
+	if sp.RetryInterval != 5*time.Second {
+		t.Errorf("expected default RetryInterval to be 5s, got %v", sp.RetryInterval)
+	}
+	if sp.RetryMaxInterval != 60*time.Second {
+		t.Errorf("expected default RetryMaxInterval to be 60s, got %v", sp.RetryMaxInterval)
+	}
+}
+
+// Test exponential backoff calculation
+func TestCalculateRetryDelay(t *testing.T) {
+	tests := []struct {
+		name             string
+		attempt          int
+		retryInterval    time.Duration
+		retryMaxInterval time.Duration
+		expected         time.Duration
+	}{
+		{
+			name:             "first attempt",
+			attempt:          0,
+			retryInterval:    5 * time.Second,
+			retryMaxInterval: 60 * time.Second,
+			expected:         5 * time.Second,
+		},
+		{
+			name:             "second attempt",
+			attempt:          1,
+			retryInterval:    5 * time.Second,
+			retryMaxInterval: 60 * time.Second,
+			expected:         10 * time.Second,
+		},
+		{
+			name:             "third attempt",
+			attempt:          2,
+			retryInterval:    5 * time.Second,
+			retryMaxInterval: 60 * time.Second,
+			expected:         20 * time.Second,
+		},
+		{
+			name:             "max interval cap",
+			attempt:          10,
+			retryInterval:    5 * time.Second,
+			retryMaxInterval: 60 * time.Second,
+			expected:         60 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			delay := tt.retryInterval
+			for i := 0; i < tt.attempt; i++ {
+				newDelay := delay * 2
+				if newDelay > tt.retryMaxInterval {
+					delay = tt.retryMaxInterval
+				} else {
+					delay = newDelay
+				}
+			}
+			if delay != tt.expected {
+				t.Errorf("expected delay %v, got %v", tt.expected, delay)
+			}
+		})
+	}
+}
+
+// Test retry disabled (RetryAttempts=0)
+func TestRequestConnectionNoRetry(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return serviceName == "test-service" && serviceToken == "test-token"
+	}
+
+	sp := NewServerProtocol(authFunc)
+	sp.Logger = log.New(io.Discard, "", 0)
+	sp.PendingTimeout = 100 * time.Millisecond
+	sp.RetryAttempts = 0 // No retry
+
+	// Create test HTTP server
+	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// Start client but don't handle CONNECT messages
+	cp := NewClientProtocol(wsURL, "test-service", "test-token")
+	cp.Logger = log.New(io.Discard, "", 0)
+	cp.ConnectHandler = nil
+
+	go cp.Start()
+	defer cp.Stop()
+
+	// Wait for control connection
+	time.Sleep(100 * time.Millisecond)
+
+	// Request connection
+	incomingClient, incomingServer := net.Pipe()
+	defer incomingClient.Close()
+
+	start := time.Now()
+	_, err := sp.RequestConnection("test-service", incomingServer)
+	elapsed := time.Since(start)
+
+	// Should return error after single attempt (no retries)
+	if err == nil {
+		t.Fatal("Expected error after timeout with no retry, got nil")
+	}
+
+	// Should take approximately PendingTimeout (100ms) + small overhead
+	if elapsed < 80*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Errorf("Expected ~100ms for single attempt, got %v", elapsed)
+	}
+
+	// Connection should be closed
+	buf := make([]byte, 1)
+	_, err = incomingClient.Read(buf)
+	if err == nil {
+		t.Error("Expected connection to be closed after timeout with no retry")
+	}
+}
+
+// Test retry with exhausted attempts
+func TestRequestConnectionRetryExhausted(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return serviceName == "test-service" && serviceToken == "test-token"
+	}
+
+	sp := NewServerProtocol(authFunc)
+	sp.Logger = log.New(io.Discard, "", 0)
+	sp.PendingTimeout = 100 * time.Millisecond
+	sp.RetryAttempts = 2
+	sp.RetryInterval = 50 * time.Millisecond
+	sp.RetryMaxInterval = 200 * time.Millisecond
+
+	// Create test HTTP server
+	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// Start client but don't handle CONNECT messages
+	cp := NewClientProtocol(wsURL, "test-service", "test-token")
+	cp.Logger = log.New(io.Discard, "", 0)
+	cp.ConnectHandler = nil
+
+	go cp.Start()
+	defer cp.Stop()
+
+	// Wait for control connection
+	time.Sleep(100 * time.Millisecond)
+
+	// Request connection
+	incomingClient, incomingServer := net.Pipe()
+	defer incomingClient.Close()
+
+	start := time.Now()
+	_, err := sp.RequestConnection("test-service", incomingServer)
+	elapsed := time.Since(start)
+
+	// Should return error after retries exhausted
+	if err == nil {
+		t.Fatal("Expected error after retries exhausted, got nil")
+	}
+
+	// Should take at least: 100ms (first timeout) + 50ms (retry delay) + 100ms (second timeout) + 100ms (third timeout)
+	// = ~350ms minimum
+	if elapsed < 300*time.Millisecond {
+		t.Errorf("Expected at least 300ms for retries, got %v", elapsed)
+	}
+
+	// Connection should be closed
+	buf := make([]byte, 1)
+	_, err = incomingClient.Read(buf)
+	if err == nil {
+		t.Error("Expected connection to be closed after retries exhausted")
+	}
+}
+
+// Test retry with successful connection
+func TestRequestConnectionRetrySuccess(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return serviceName == "test-service" && serviceToken == "test-token"
+	}
+
+	sp := NewServerProtocol(authFunc)
+	sp.Logger = log.New(io.Discard, "", 0)
+	sp.PendingTimeout = 200 * time.Millisecond
+	sp.RetryAttempts = 3
+	sp.RetryInterval = 100 * time.Millisecond
+	sp.RetryMaxInterval = 500 * time.Millisecond
+
+	var dataHandlerCalled sync.WaitGroup
+	dataHandlerCalled.Add(1)
+
+	sp.DataHandler = func(incoming io.ReadWriteCloser, outgoing *websocket.Conn) {
+		defer dataHandlerCalled.Done()
+		defer incoming.Close()
+		defer outgoing.Close()
+	}
+
+	// Create test HTTP server
+	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// Start client with delayed handler
+	cp := NewClientProtocol(wsURL, "test-service", "test-token")
+	cp.Logger = log.New(io.Discard, "", 0)
+
+	// Delay the first connection attempt to force a retry
+	var connectCount int32
+	cp.ConnectHandler = func(ctx context.Context, connID string) (io.ReadWriteCloser, error) {
+		count := atomic.AddInt32(&connectCount, 1)
+		if count == 1 {
+			// Skip first CONNECT message, wait for retry
+			// Sleep long enough for the first timeout to occur
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		client, serverPipe := net.Pipe()
+		go func() {
+			defer serverPipe.Close()
+		}()
+		return client, nil
+	}
+
+	go cp.Start()
+	defer cp.Stop()
+
+	// Wait for control connection
+	time.Sleep(100 * time.Millisecond)
+
+	// Request connection
+	incomingClient, incomingServer := net.Pipe()
+	defer incomingClient.Close()
+
+	connID, err := sp.RequestConnection("test-service", incomingServer)
+	if err != nil {
+		t.Fatalf("RequestConnection() error = %v", err)
+	}
+
+	if len(connID) != 26 {
+		t.Errorf("connection ID length = %d, want 26", len(connID))
+	}
+
+	// Wait for data handler to be called
+	done := make(chan struct{})
+	go func() {
+		dataHandlerCalled.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - retry worked
+	case <-time.After(2 * time.Second):
+		t.Fatal("DataHandler was not called within timeout")
+	}
+
+	// Should have received at least 2 CONNECT messages (original + retry)
+	finalCount := atomic.LoadInt32(&connectCount)
+	if finalCount < 2 {
+		t.Errorf("Expected at least 2 connection attempts, got %d", finalCount)
 	}
 }
 

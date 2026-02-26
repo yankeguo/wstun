@@ -57,6 +57,33 @@ func TestServerOptions_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "negative retry_attempts",
+			opts: ServerOptions{
+				ListenAddr:    ":8080",
+				ServicesDir:   "./services",
+				RetryAttempts: -1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative retry_interval",
+			opts: ServerOptions{
+				ListenAddr:    ":8080",
+				ServicesDir:   "./services",
+				RetryInterval: -1 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative retry_max_interval",
+			opts: ServerOptions{
+				ListenAddr:       ":8080",
+				ServicesDir:      "./services",
+				RetryMaxInterval: -1 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
 			name: "tls_cert without tls_key",
 			opts: ServerOptions{
 				ListenAddr:  ":8080",
@@ -86,6 +113,12 @@ func TestServerOptions_SetDefaults(t *testing.T) {
 
 	if opts.LogLevel != "info" {
 		t.Errorf("expected default log_level to be 'info', got '%s'", opts.LogLevel)
+	}
+	if opts.RetryInterval != 5*time.Second {
+		t.Errorf("expected default retry_interval to be 5s, got %v", opts.RetryInterval)
+	}
+	if opts.RetryMaxInterval != 60*time.Second {
+		t.Errorf("expected default retry_max_interval to be 60s, got %v", opts.RetryMaxInterval)
 	}
 }
 
@@ -262,6 +295,17 @@ log_level: "info"
 log_level: "info"
 `,
 			wantErr: true,
+		},
+		{
+			name: "valid config with retry settings",
+			content: `listen_addr: ":8080"
+services_dir: "./services"
+log_level: "info"
+retry_attempts: 3
+retry_interval: 5s
+retry_max_interval: 60s
+`,
+			wantErr: false,
 		},
 	}
 

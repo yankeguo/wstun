@@ -54,6 +54,15 @@ type ServerProtocol struct {
 	// PendingTimeout is the maximum time to wait for HANDLE after sending CONNECT
 	PendingTimeout time.Duration
 
+	// RetryAttempts is the maximum number of retry attempts for connection requests (0 = no retry)
+	RetryAttempts int
+
+	// RetryInterval is the initial retry interval
+	RetryInterval time.Duration
+
+	// RetryMaxInterval is the maximum retry interval
+	RetryMaxInterval time.Duration
+
 	// Logger for protocol events (optional)
 	Logger *log.Logger
 
@@ -81,8 +90,11 @@ type controlConnection struct {
 // NewServerProtocol creates a new server protocol handler.
 func NewServerProtocol(authFunc ServiceAuthFunc) *ServerProtocol {
 	return &ServerProtocol{
-		AuthFunc:       authFunc,
-		PendingTimeout: 30 * time.Second,
+		AuthFunc:         authFunc,
+		PendingTimeout:   30 * time.Second,
+		RetryAttempts:    0,
+		RetryInterval:    5 * time.Second,
+		RetryMaxInterval: 60 * time.Second,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Accept all origins; security is via BasicAuth
@@ -230,36 +242,74 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 		return "", fmt.Errorf("failed to generate connection ID: %w", err)
 	}
 
-	// Create pending connection with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), sp.PendingTimeout)
-	pending := &pendingConnection{
-		serviceName: serviceName,
-		incoming:    incoming,
-		created:     time.Now(),
-		cancel:      cancel,
-	}
+	// Attempt connection with retry logic
+	attempt := 0
+	delay := sp.RetryInterval
 
-	sp.pendingConns.Store(connID, pending)
-
-	// Start timeout handler
-	go func() {
-		<-ctx.Done()
-		if ctx.Err() == context.DeadlineExceeded {
-			// Timeout occurred, remove pending connection
-			if _, ok := sp.pendingConns.Load(connID); ok {
-				sp.pendingConns.Delete(connID)
-				incoming.Close()
-				sp.logf("Connection request timeout for ID: %s", connID)
-			}
+	for {
+		// Create pending connection with timeout context
+		ctx, cancel := context.WithTimeout(context.Background(), sp.PendingTimeout)
+		pending := &pendingConnection{
+			serviceName: serviceName,
+			incoming:    incoming,
+			created:     time.Now(),
+			cancel:      cancel,
 		}
-	}()
 
-	// Send CONNECT message to control connections for this service
-	message := FormatConnectMessage(connID)
-	sp.sendToControlConnections(serviceName, message)
+		sp.pendingConns.Store(connID, pending)
 
-	sp.logf("Connection request sent to service %s with ID: %s", serviceName, connID)
-	return connID, nil
+		// Start timeout handler
+		timeoutChan := make(chan bool, 1)
+		go func() {
+			<-ctx.Done()
+			timedOut := ctx.Err() == context.DeadlineExceeded
+			if timedOut {
+				// Timeout occurred, remove pending connection
+				if _, ok := sp.pendingConns.Load(connID); ok {
+					sp.pendingConns.Delete(connID)
+				}
+			}
+			timeoutChan <- timedOut
+		}()
+
+		// Send CONNECT message to control connections for this service
+		message := FormatConnectMessage(connID)
+		sp.sendToControlConnections(serviceName, message)
+
+		if attempt == 0 {
+			sp.logf("Connection request sent to service %s with ID: %s", serviceName, connID)
+		} else {
+			sp.logf("Retrying connection request for service %s with ID: %s (attempt %d/%d)", serviceName, connID, attempt, sp.RetryAttempts)
+		}
+
+		// Wait for timeout or success
+		timedOut := <-timeoutChan
+
+		if !timedOut {
+			// Connection was successful (cancelled by data connection handler)
+			return connID, nil
+		}
+
+		// Check if we should retry
+		if attempt >= sp.RetryAttempts {
+			// No more retries, close connection and return error
+			incoming.Close()
+			return "", fmt.Errorf("connection request failed after %d attempts", attempt+1)
+		}
+
+		// Increment attempt and calculate next delay with exponential backoff
+		attempt++
+		sp.logf("Connection timeout for ID: %s, retrying in %v (attempt %d/%d)", connID, delay, attempt, sp.RetryAttempts)
+		time.Sleep(delay)
+
+		// Exponential backoff: delay = delay * 2, capped at RetryMaxInterval
+		newDelay := delay * 2
+		if newDelay > sp.RetryMaxInterval {
+			delay = sp.RetryMaxInterval
+		} else {
+			delay = newDelay
+		}
+	}
 }
 
 func (sp *ServerProtocol) registerControlConnection(serviceName string, conn *websocket.Conn) {
