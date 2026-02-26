@@ -185,9 +185,9 @@ func (sp *ServerProtocol) handleControlConnection(conn *websocket.Conn, serviceN
 func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName string, connID string) {
 	sp.logf("Data connection received for service %s, connection ID: %s", serviceName, connID)
 
-	// Look up pending connection
-	value, ok := sp.pendingConns.Load(connID)
-	if !ok {
+	// Atomically load and delete pending connection
+	value, loaded := sp.pendingConns.LoadAndDelete(connID)
+	if !loaded {
 		conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Unknown connection ID"),
 			time.Now().Add(time.Second))
@@ -204,13 +204,13 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Connection ID mismatch"),
 			time.Now().Add(time.Second))
 		conn.Close()
+		pending.incoming.Close()
 		sp.logf("Connection ID %s does not belong to service %s", connID, serviceName)
 		return
 	}
 
-	// Remove from pending
-	sp.pendingConns.Delete(connID)
-	pending.cancel() // Cancel timeout
+	// Cancel timeout
+	pending.cancel()
 
 	sp.logf("Data connection matched for service %s, connection ID: %s", serviceName, connID)
 
@@ -220,9 +220,9 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 		defer func() {
 			if r := recover(); r != nil {
 				sp.logf("Panic in DataHandler for connection %s: %v", connID, r)
-				conn.Close()
-				pending.incoming.Close()
 			}
+			conn.Close()
+			pending.incoming.Close()
 		}()
 		sp.DataHandler(pending.incoming, conn)
 	} else {
@@ -244,7 +244,6 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 
 	// Attempt connection with retry logic
 	attempt := 0
-	delay := sp.RetryInterval
 
 	for {
 		// Create pending connection with timeout context
@@ -264,9 +263,11 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			<-ctx.Done()
 			timedOut := ctx.Err() == context.DeadlineExceeded
 			if timedOut {
-				// Timeout occurred, remove pending connection
-				if _, ok := sp.pendingConns.Load(connID); ok {
-					sp.pendingConns.Delete(connID)
+				// Timeout occurred, atomically remove and close pending connection
+				if value, loaded := sp.pendingConns.LoadAndDelete(connID); loaded {
+					pending := value.(*pendingConnection)
+					pending.incoming.Close()
+					sp.logf("Connection timeout, closed pending connection: %s", connID)
 				}
 			}
 			timeoutChan <- timedOut
@@ -290,25 +291,15 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			return connID, nil
 		}
 
+		// Timeout occurred, incoming connection is already closed by timeout goroutine
 		// Check if we should retry
 		if attempt >= sp.RetryAttempts {
-			// No more retries, close connection and return error
-			incoming.Close()
 			return "", fmt.Errorf("connection request failed after %d attempts", attempt+1)
 		}
 
-		// Increment attempt and calculate next delay with exponential backoff
-		attempt++
-		sp.logf("Connection timeout for ID: %s, retrying in %v (attempt %d/%d)", connID, delay, attempt, sp.RetryAttempts)
-		time.Sleep(delay)
-
-		// Exponential backoff: delay = delay * 2, capped at RetryMaxInterval
-		newDelay := delay * 2
-		if newDelay > sp.RetryMaxInterval {
-			delay = sp.RetryMaxInterval
-		} else {
-			delay = newDelay
-		}
+		// Cannot retry with closed incoming connection, fail immediately
+		sp.logf("Connection timeout for ID: %s, cannot retry (incoming closed)", connID)
+		return "", fmt.Errorf("connection request timed out for ID: %s", connID)
 	}
 }
 

@@ -603,7 +603,7 @@ func TestRequestConnectionNoRetry(t *testing.T) {
 	}
 }
 
-// Test retry with exhausted attempts
+// Test retry with exhausted attempts (now fails immediately on timeout)
 func TestRequestConnectionRetryExhausted(t *testing.T) {
 	authFunc := func(serviceName, serviceToken string) bool {
 		return serviceName == "test-service" && serviceToken == "test-token"
@@ -641,26 +641,25 @@ func TestRequestConnectionRetryExhausted(t *testing.T) {
 	_, err := sp.RequestConnection("test-service", incomingServer)
 	elapsed := time.Since(start)
 
-	// Should return error after retries exhausted
+	// Should return error after timeout (no retry despite RetryAttempts > 0)
 	if err == nil {
-		t.Fatal("Expected error after retries exhausted, got nil")
+		t.Fatal("Expected error after timeout, got nil")
 	}
 
-	// Should take at least: 100ms (first timeout) + 50ms (retry delay) + 100ms (second timeout) + 100ms (third timeout)
-	// = ~350ms minimum
-	if elapsed < 300*time.Millisecond {
-		t.Errorf("Expected at least 300ms for retries, got %v", elapsed)
+	// Should take approximately PendingTimeout (100ms) + small overhead (not multiple retries)
+	if elapsed < 80*time.Millisecond || elapsed > 200*time.Millisecond {
+		t.Errorf("Expected ~100ms for single timeout, got %v", elapsed)
 	}
 
 	// Connection should be closed
 	buf := make([]byte, 1)
 	_, err = incomingClient.Read(buf)
 	if err == nil {
-		t.Error("Expected connection to be closed after retries exhausted")
+		t.Error("Expected connection to be closed after timeout")
 	}
 }
 
-// Test retry with successful connection
+// Test successful connection (no retry needed)
 func TestRequestConnectionRetrySuccess(t *testing.T) {
 	authFunc := func(serviceName, serviceToken string) bool {
 		return serviceName == "test-service" && serviceToken == "test-token"
@@ -688,20 +687,13 @@ func TestRequestConnectionRetrySuccess(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 
-	// Start client with delayed handler
+	// Start client with immediate handler (no delay)
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
 	cp.Logger = log.New(io.Discard, "", 0)
 
-	// Delay the first connection attempt to force a retry
 	var connectCount int32
 	cp.ConnectHandler = func(ctx context.Context, connID string) (io.ReadWriteCloser, error) {
-		count := atomic.AddInt32(&connectCount, 1)
-		if count == 1 {
-			// Skip first CONNECT message, wait for retry
-			// Sleep long enough for the first timeout to occur
-			time.Sleep(300 * time.Millisecond)
-		}
-
+		atomic.AddInt32(&connectCount, 1)
 		client, serverPipe := net.Pipe()
 		go func() {
 			defer serverPipe.Close()
@@ -737,15 +729,15 @@ func TestRequestConnectionRetrySuccess(t *testing.T) {
 
 	select {
 	case <-done:
-		// Success - retry worked
+		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("DataHandler was not called within timeout")
 	}
 
-	// Should have received at least 2 CONNECT messages (original + retry)
+	// Should have received exactly 1 CONNECT message (no retry needed)
 	finalCount := atomic.LoadInt32(&connectCount)
-	if finalCount < 2 {
-		t.Errorf("Expected at least 2 connection attempts, got %d", finalCount)
+	if finalCount != 1 {
+		t.Errorf("Expected 1 connection attempt, got %d", finalCount)
 	}
 }
 
