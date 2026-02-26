@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -16,6 +17,11 @@ import (
 
 	"cnb.cool/yankeguo/wstun"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	maxReconnectDelay = 60 * time.Second
+	jitterPercent     = 0.3
 )
 
 // Client encapsulates the client state and operations.
@@ -119,7 +125,6 @@ func NewClient(config *wstun.ClientOptions, logger *log.Logger) *Client {
 	}
 }
 
-// Run starts the client with reconnection logic.
 func (c *Client) Run() error {
 	attempt := 0
 	delay := c.config.ReconnectInterval
@@ -131,7 +136,6 @@ func (c *Client) Run() error {
 		default:
 		}
 
-		// Create protocol instance with mutex protection
 		c.protocolMu.Lock()
 		c.protocol = wstun.NewClientProtocol(
 			c.config.ServerURL,
@@ -139,8 +143,10 @@ func (c *Client) Run() error {
 			c.config.ServiceToken,
 		)
 		c.protocol.Logger = c.logger
+		c.protocol.PingInterval = c.config.PingInterval
+		c.protocol.PongWait = c.config.PongTimeout
+		c.protocol.WriteWait = c.config.WriteTimeout
 
-		// Configure TLS
 		if c.config.TLSInsecure {
 			c.protocol.Dialer = &websocket.Dialer{
 				TLSClientConfig: &tls.Config{
@@ -149,11 +155,9 @@ func (c *Client) Run() error {
 			}
 		}
 
-		// Set connect handler
 		c.protocol.ConnectHandler = c.handleConnect
 		c.protocolMu.Unlock()
 
-		// Start protocol (blocks until disconnect)
 		if shouldLog(c.config.LogLevel, "info") {
 			if attempt == 0 {
 				c.logger.Printf("Connecting to server...")
@@ -164,49 +168,51 @@ func (c *Client) Run() error {
 
 		err := c.protocol.Start()
 
-		// Check if shutdown was requested
 		select {
 		case <-c.shutdown:
 			return nil
 		default:
 		}
 
-		// Handle error and reconnection
 		if err != nil {
 			c.logger.Printf("Connection error: %v", err)
 		} else {
 			c.logger.Printf("Connection closed")
 		}
 
-		// Increment attempt counter
 		attempt++
 
-		// Check max attempts
 		if c.config.MaxReconnectAttempts > 0 && attempt >= c.config.MaxReconnectAttempts {
 			return fmt.Errorf("max reconnection attempts (%d) reached", c.config.MaxReconnectAttempts)
 		}
 
-		// Wait before reconnecting
+		actualDelay := addJitter(delay, jitterPercent)
 		if shouldLog(c.config.LogLevel, "info") {
-			c.logger.Printf("Reconnecting in %v...", delay)
+			c.logger.Printf("Reconnecting in %v...", actualDelay)
 		}
 
 		select {
 		case <-c.shutdown:
 			return nil
-		case <-time.After(delay):
-			// Continue to next attempt
+		case <-time.After(actualDelay):
 		}
 
-		// Exponential backoff with cap and overflow protection
 		newDelay := delay * 2
-		if newDelay < delay || newDelay > 60*time.Second {
-			// Overflow detected or exceeded cap
-			delay = 60 * time.Second
+		if newDelay < delay || newDelay > maxReconnectDelay {
+			delay = maxReconnectDelay
 		} else {
 			delay = newDelay
 		}
 	}
+}
+
+func addJitter(d time.Duration, jitter float64) time.Duration {
+	if d <= 0 || jitter <= 0 {
+		return d
+	}
+	jitterRange := float64(d) * jitter
+	jitterValue := rand.Float64()*jitterRange*2 - jitterRange
+	return time.Duration(float64(d) + jitterValue)
 }
 
 // handleConnect handles CONNECT requests by establishing TCP connection to target.
@@ -232,11 +238,9 @@ func (c *Client) handleConnect(ctx context.Context, connID string) (io.ReadWrite
 	return conn, nil
 }
 
-// Shutdown gracefully shuts down the client.
 func (c *Client) Shutdown() error {
 	close(c.shutdown)
 
-	// Safely access protocol with read lock
 	c.protocolMu.RLock()
 	protocol := c.protocol
 	c.protocolMu.RUnlock()
@@ -244,6 +248,13 @@ func (c *Client) Shutdown() error {
 	if protocol != nil {
 		if err := protocol.Stop(); err != nil {
 			c.logger.Printf("Protocol stop error: %v", err)
+		}
+
+		c.logger.Printf("Waiting for active connections to close...")
+		if protocol.WaitForActiveConnections(5 * time.Second) {
+			c.logger.Printf("All connections closed")
+		} else {
+			c.logger.Printf("Timeout waiting for connections, some may be forcefully closed")
 		}
 	}
 

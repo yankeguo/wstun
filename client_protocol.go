@@ -3,64 +3,76 @@ package wstun
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// ConnectRequestHandler is called when the client receives a CONNECT message from the server.
-// The handler should establish a connection to the target service and return a ReadWriteCloser.
+var (
+	ErrClientStopped = errors.New("client stopped")
+)
+
+const (
+	defaultPingInterval     = 30 * time.Second
+	defaultPongWait         = 60 * time.Second
+	defaultWriteWait        = 10 * time.Second
+	defaultReadTimeout      = 0
+	dataConnectMaxRetries   = 3
+	dataConnectRetryDelay   = 500 * time.Millisecond
+	gracefulShutdownTimeout = 5 * time.Second
+)
+
 type ConnectRequestHandler func(ctx context.Context, connID string) (io.ReadWriteCloser, error)
 
-// ClientProtocol manages WebSocket protocol handling on the client side.
 type ClientProtocol struct {
-	// ServerURL is the WebSocket server URL
-	ServerURL string
-
-	// ServiceName is the service identifier
-	ServiceName string
-
-	// ServiceToken is the authentication token
-	ServiceToken string
-
-	// ConnectHandler is called when CONNECT message is received
+	ServerURL      string
+	ServiceName    string
+	ServiceToken   string
 	ConnectHandler ConnectRequestHandler
+	Logger         *log.Logger
+	Dialer         *websocket.Dialer
 
-	// Logger for protocol events (optional)
-	Logger *log.Logger
+	PingInterval time.Duration
+	PongWait     time.Duration
+	WriteWait    time.Duration
 
-	// Dialer for WebSocket connections
-	Dialer *websocket.Dialer
-
-	controlConn *websocket.Conn
-	controlMu   sync.Mutex
-	ctx         context.Context
-	cancel      context.CancelFunc
+	controlConn  *websocket.Conn
+	controlMu    sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	activeConns  int64
+	shutdownMode atomic.Bool
 }
 
 // NewClientProtocol creates a new client protocol handler.
 func NewClientProtocol(serverURL, serviceName, serviceToken string) *ClientProtocol {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &ClientProtocol{
+	cp := &ClientProtocol{
 		ServerURL:    serverURL,
 		ServiceName:  serviceName,
 		ServiceToken: serviceToken,
 		Dialer:       websocket.DefaultDialer,
+		PingInterval: defaultPingInterval,
+		PongWait:     defaultPongWait,
+		WriteWait:    defaultWriteWait,
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+	return cp
 }
 
 // Start establishes the control connection and starts listening for CONNECT messages.
 // This method blocks until the connection is closed or an error occurs.
 func (cp *ClientProtocol) Start() error {
-	// Establish control connection
 	conn, err := cp.dial()
 	if err != nil {
 		return fmt.Errorf("failed to establish control connection: %w", err)
@@ -68,31 +80,88 @@ func (cp *ClientProtocol) Start() error {
 
 	cp.controlMu.Lock()
 	cp.controlConn = conn
+	cp.shutdownMode.Store(false)
 	cp.controlMu.Unlock()
 
 	defer func() {
-		cp.controlMu.Lock()
-		if cp.controlConn != nil {
-			cp.controlConn.Close()
-			cp.controlConn = nil
-		}
-		cp.controlMu.Unlock()
+		cp.closeControlConn()
 	}()
 
-	// Send WAITING message
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(cp.PongWait))
+	})
+
+	if err := conn.SetReadDeadline(time.Now().Add(cp.PongWait)); err != nil {
+		return fmt.Errorf("failed to set read deadline: %w", err)
+	}
+
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(MessageTypeWaiting)); err != nil {
 		return fmt.Errorf("failed to send WAITING message: %w", err)
 	}
 
 	cp.logf("Control connection established, WAITING message sent")
 
-	// Listen for messages
-	return cp.listenControl(conn)
+	cp.wg.Add(1)
+	go cp.pingLoop(conn)
+
+	err = cp.listenControl(conn)
+
+	cp.cancel()
+	cp.wg.Wait()
+
+	return err
 }
 
-// Stop closes the control connection and stops the client.
+func (cp *ClientProtocol) pingLoop(conn *websocket.Conn) {
+	defer cp.wg.Done()
+
+	ticker := time.NewTicker(cp.PingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-cp.ctx.Done():
+			return
+		case <-ticker.C:
+			cp.controlMu.Lock()
+			if cp.controlConn == nil {
+				cp.controlMu.Unlock()
+				return
+			}
+			err := cp.controlConn.WriteControl(websocket.PingMessage, nil, time.Now().Add(cp.WriteWait))
+			cp.controlMu.Unlock()
+			if err != nil {
+				cp.logf("Ping failed: %v", err)
+				return
+			}
+		}
+	}
+}
+
+func (cp *ClientProtocol) closeControlConn() {
+	cp.controlMu.Lock()
+	defer cp.controlMu.Unlock()
+	if cp.controlConn != nil {
+		cp.controlConn.Close()
+		cp.controlConn = nil
+	}
+}
+
 func (cp *ClientProtocol) Stop() error {
+	cp.shutdownMode.Store(true)
 	cp.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		cp.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(gracefulShutdownTimeout):
+		cp.logf("Graceful shutdown timeout, forcing close")
+	}
 
 	cp.controlMu.Lock()
 	defer cp.controlMu.Unlock()
@@ -108,6 +177,17 @@ func (cp *ClientProtocol) Stop() error {
 		return err
 	}
 	return nil
+}
+
+func (cp *ClientProtocol) WaitForActiveConnections(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&cp.activeConns) == 0 {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
 
 func (cp *ClientProtocol) dial() (*websocket.Conn, error) {
@@ -154,7 +234,14 @@ func (cp *ClientProtocol) listenControl(conn *websocket.Conn) error {
 				cp.logf("Control connection closed normally")
 				return nil
 			}
+			if errors.Is(err, context.Canceled) || cp.ctx.Err() != nil {
+				return nil
+			}
 			return fmt.Errorf("failed to read message: %w", err)
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(cp.PongWait)); err != nil {
+			cp.logf("Failed to update read deadline: %v", err)
 		}
 
 		if messageType != websocket.TextMessage {
@@ -164,7 +251,6 @@ func (cp *ClientProtocol) listenControl(conn *websocket.Conn) error {
 
 		messageStr := string(message)
 
-		// Parse CONNECT message
 		if connID, ok := ParseConnectMessage(messageStr); ok {
 			cp.logf("Received CONNECT request: %s", connID)
 			go cp.handleConnectRequest(connID)
@@ -175,7 +261,6 @@ func (cp *ClientProtocol) listenControl(conn *websocket.Conn) error {
 }
 
 func (cp *ClientProtocol) handleConnectRequest(connID string) {
-	// Use defer/recover to catch panics
 	defer func() {
 		if r := recover(); r != nil {
 			cp.logf("Panic in handleConnectRequest for %s: %v", connID, r)
@@ -187,11 +272,17 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 		return
 	}
 
-	// Create context with timeout for establishing connection
+	if cp.shutdownMode.Load() {
+		cp.logf("Client in shutdown mode, ignoring CONNECT request: %s", connID)
+		return
+	}
+
+	atomic.AddInt64(&cp.activeConns, 1)
+	defer atomic.AddInt64(&cp.activeConns, -1)
+
 	ctx, cancel := context.WithTimeout(cp.ctx, 30*time.Second)
 	defer cancel()
 
-	// Get connection to target service
 	target, err := cp.ConnectHandler(ctx, connID)
 	if err != nil {
 		cp.logf("Failed to connect to target for %s: %v", connID, err)
@@ -203,15 +294,37 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 	}
 	defer target.Close()
 
-	// Establish data connection to server
-	dataConn, err := cp.dial()
-	if err != nil {
-		cp.logf("Failed to establish data connection for %s: %v", connID, err)
+	var dataConn *websocket.Conn
+	var lastErr error
+
+	for attempt := 0; attempt < dataConnectMaxRetries; attempt++ {
+		if cp.shutdownMode.Load() || cp.ctx.Err() != nil {
+			cp.logf("Client shutting down, aborting data connection for %s", connID)
+			return
+		}
+
+		dataConn, lastErr = cp.dial()
+		if lastErr == nil {
+			break
+		}
+
+		cp.logf("Data connection attempt %d/%d failed for %s: %v", attempt+1, dataConnectMaxRetries, connID, lastErr)
+
+		if attempt < dataConnectMaxRetries-1 {
+			select {
+			case <-cp.ctx.Done():
+				return
+			case <-time.After(dataConnectRetryDelay):
+			}
+		}
+	}
+
+	if lastErr != nil {
+		cp.logf("Failed to establish data connection for %s after %d attempts: %v", connID, dataConnectMaxRetries, lastErr)
 		return
 	}
 	defer dataConn.Close()
 
-	// Send HANDLE message
 	if err := dataConn.WriteMessage(websocket.TextMessage, []byte(FormatHandleMessage(connID))); err != nil {
 		cp.logf("Failed to send HANDLE message for %s: %v", connID, err)
 		return
@@ -219,40 +332,42 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 
 	cp.logf("Data connection established for: %s", connID)
 
-	// Perform bidirectional data transfer
 	cp.transfer(dataConn, target, connID)
 }
 
-// transfer performs bidirectional data transfer between WebSocket and target connection.
 func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser, connID string) {
 	var wg sync.WaitGroup
 	var closeChOnce sync.Once
 	var closeWSOnce sync.Once
+	var closeTargetOnce sync.Once
 	closeCh := make(chan struct{})
 
-	// signalClose signals both goroutines to stop
 	signalClose := func() {
 		closeChOnce.Do(func() {
 			close(closeCh)
 		})
 	}
 
-	// closeWebSocket gracefully closes the WebSocket connection
 	closeWebSocket := func() {
 		closeWSOnce.Do(func() {
 			ws.WriteControl(websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-				time.Now().Add(time.Second))
+				time.Now().Add(cp.WriteWait))
 			ws.Close()
+		})
+	}
+
+	closeTarget := func() {
+		closeTargetOnce.Do(func() {
+			target.Close()
 		})
 	}
 
 	wg.Add(2)
 
-	// WebSocket -> Target
 	go func() {
 		defer wg.Done()
-		defer target.Close()
+		defer closeTarget()
 		defer signalClose()
 		defer func() {
 			if r := recover(); r != nil {
@@ -267,10 +382,17 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 			default:
 			}
 
+			if err := ws.SetReadDeadline(time.Now().Add(cp.PongWait)); err != nil {
+				cp.logf("[%s] Failed to set read deadline: %v", connID, err)
+				return
+			}
+
 			messageType, data, err := ws.ReadMessage()
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					cp.logf("[%s] WebSocket read error: %v", connID, err)
+					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+						cp.logf("[%s] WebSocket read error: %v", connID, err)
+					}
 				}
 				return
 			}
@@ -280,7 +402,6 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 				continue
 			}
 
-			// Handle zero-length data
 			if len(data) == 0 {
 				continue
 			}
@@ -292,7 +413,6 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 		}
 	}()
 
-	// Target -> WebSocket
 	go func() {
 		defer wg.Done()
 		defer closeWebSocket()
@@ -303,7 +423,7 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 			}
 		}()
 
-		buf := make([]byte, 32*1024) // 32KB buffer
+		buf := make([]byte, 32*1024)
 		for {
 			select {
 			case <-closeCh:
@@ -313,15 +433,19 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 
 			n, err := target.Read(buf)
 			if err != nil {
-				if err != io.EOF {
+				if err != io.EOF && !errors.Is(err, context.Canceled) {
 					cp.logf("[%s] Target read error: %v", connID, err)
 				}
 				return
 			}
 
-			// Handle zero-length reads
 			if n <= 0 {
 				continue
+			}
+
+			if err := ws.SetWriteDeadline(time.Now().Add(cp.WriteWait)); err != nil {
+				cp.logf("[%s] Failed to set write deadline: %v", connID, err)
+				return
 			}
 
 			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {

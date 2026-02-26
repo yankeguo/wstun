@@ -128,31 +128,18 @@ func (o *ServerOptions) SetDefaults() {
 	}
 }
 
-// ClientOptions represents the configuration for the WebSocket tunnel client.
 type ClientOptions struct {
-	// ServerURL is the WebSocket server URL to connect to (required)
-	ServerURL string `yaml:"server_url"`
-
-	// ServiceName is the name of the service to expose (required)
-	ServiceName string `yaml:"service_name"`
-
-	// ServiceToken is the authentication token for the service (required)
-	ServiceToken string `yaml:"service_token"`
-
-	// TargetAddr is the local service address to tunnel (required)
-	TargetAddr string `yaml:"target_addr"`
-
-	// TLSInsecure skips TLS certificate verification (optional, default: false)
-	TLSInsecure bool `yaml:"tls_insecure"`
-
-	// ReconnectInterval is the time between reconnection attempts (optional, default: 5s)
-	ReconnectInterval time.Duration `yaml:"reconnect_interval"`
-
-	// MaxReconnectAttempts is the maximum number of reconnection attempts (optional, 0 = unlimited)
-	MaxReconnectAttempts int `yaml:"max_reconnect_attempts"`
-
-	// LogLevel specifies logging verbosity (optional, default: "info")
-	LogLevel string `yaml:"log_level"`
+	ServerURL            string        `yaml:"server_url"`
+	ServiceName          string        `yaml:"service_name"`
+	ServiceToken         string        `yaml:"service_token"`
+	TargetAddr           string        `yaml:"target_addr"`
+	TLSInsecure          bool          `yaml:"tls_insecure"`
+	ReconnectInterval    time.Duration `yaml:"reconnect_interval"`
+	MaxReconnectAttempts int           `yaml:"max_reconnect_attempts"`
+	LogLevel             string        `yaml:"log_level"`
+	PingInterval         time.Duration `yaml:"ping_interval"`
+	PongTimeout          time.Duration `yaml:"pong_timeout"`
+	WriteTimeout         time.Duration `yaml:"write_timeout"`
 }
 
 // Validate checks if the ClientOptions configuration is valid.
@@ -218,16 +205,40 @@ func (o *ClientOptions) Validate() error {
 		return fmt.Errorf("max_reconnect_attempts must be >= 0")
 	}
 
+	if o.PingInterval < 0 {
+		return fmt.Errorf("ping_interval must be >= 0")
+	}
+
+	if o.PongTimeout < 0 {
+		return fmt.Errorf("pong_timeout must be >= 0")
+	}
+
+	if o.WriteTimeout < 0 {
+		return fmt.Errorf("write_timeout must be >= 0")
+	}
+
+	if o.PingInterval > 0 && o.PongTimeout > 0 && o.PingInterval >= o.PongTimeout {
+		return fmt.Errorf("ping_interval must be less than pong_timeout")
+	}
+
 	return nil
 }
 
-// SetDefaults applies default values to optional fields.
 func (o *ClientOptions) SetDefaults() {
 	if o.LogLevel == "" {
 		o.LogLevel = "info"
 	}
 	if o.ReconnectInterval == 0 {
 		o.ReconnectInterval = 5 * time.Second
+	}
+	if o.PingInterval == 0 {
+		o.PingInterval = 30 * time.Second
+	}
+	if o.PongTimeout == 0 {
+		o.PongTimeout = 60 * time.Second
+	}
+	if o.WriteTimeout == 0 {
+		o.WriteTimeout = 10 * time.Second
 	}
 }
 
