@@ -312,11 +312,25 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			log.Info("retrying connection request", "attempt", attempt, "max_attempts", sp.RetryAttempts)
 		}
 
+		// Fast-fail: if the CONNECT send pruned all control connections (they were
+		// all dead/stale), cancel the pending entry immediately rather than blocking
+		// for the full PendingTimeout. The background goroutine will drain timeoutChan.
+		// This dramatically reduces the observed latency for the "dead control
+		// connection" case (e.g., proxy/Istio idle-timeout killed the WebSocket).
+		manualCancel := false
+		if !sp.hasControlConnections(serviceName) {
+			if _, loaded := sp.pendingConns.LoadAndDelete(connID); loaded {
+				cancel()
+				manualCancel = true
+				log.Warn("all control connections lost during send, cancelling pending entry")
+			}
+		}
+
 		// Wait for the data connection handler to cancel the context (success)
-		// or for the deadline to fire (timeout).
+		// or for the deadline to fire (timeout / manual cancel).
 		timedOut := <-timeoutChan
 
-		if !timedOut {
+		if !timedOut && !manualCancel {
 			// Data connection was successfully matched
 			return connID, nil
 		}
@@ -396,7 +410,14 @@ func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceNam
 			err := ctrlConn.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(sp.WriteWait))
 			ctrlConn.writeMu.Unlock()
 			if err != nil {
-				log.Warn("keepalive ping failed", "error", err)
+				log.Warn("keepalive ping failed, removing dead control connection", "error", err)
+				// Proactively remove the dead connection from the registry so that the
+				// next RequestConnection call does not attempt to write to it.
+				sp.removeControlConnection(serviceName, ctrlConn)
+				// Close the underlying connection to unblock the ReadMessage loop in
+				// handleControlConnection, which triggers its deferred unregister and
+				// allows the client to detect the disconnect and reconnect.
+				ctrlConn.conn.Close()
 				return
 			}
 		}

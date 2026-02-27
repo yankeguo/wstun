@@ -75,6 +75,15 @@ type ServerOptions struct {
 
 	// RetryMaxInterval is the maximum retry interval (optional, default: 60s)
 	RetryMaxInterval time.Duration `yaml:"retry_max_interval"`
+
+	// ControlPingInterval is the interval for keepalive pings on control connections (optional, default: 15s).
+	// Reduce this value (e.g. to 5s) in environments where an intermediate proxy
+	// (such as Istio/Envoy) has a short idle-connection timeout, to keep control
+	// WebSockets alive and detect dead connections quickly.
+	ControlPingInterval time.Duration `yaml:"control_ping_interval"`
+
+	// WriteWait is the deadline for WebSocket write operations on the server (optional, default: 10s).
+	WriteWait time.Duration `yaml:"write_wait"`
 }
 
 // Validate checks if the ServerOptions configuration is valid.
@@ -125,6 +134,14 @@ func (o *ServerOptions) Validate() error {
 		return fmt.Errorf("retry_max_interval must be >= 0")
 	}
 
+	if o.ControlPingInterval < 0 {
+		return fmt.Errorf("control_ping_interval must be >= 0")
+	}
+
+	if o.WriteWait < 0 {
+		return fmt.Errorf("write_wait must be >= 0")
+	}
+
 	return nil
 }
 
@@ -138,6 +155,12 @@ func (o *ServerOptions) SetDefaults() {
 	}
 	if o.RetryMaxInterval == 0 {
 		o.RetryMaxInterval = 60 * time.Second
+	}
+	if o.ControlPingInterval == 0 {
+		o.ControlPingInterval = 15 * time.Second
+	}
+	if o.WriteWait == 0 {
+		o.WriteWait = 10 * time.Second
 	}
 }
 

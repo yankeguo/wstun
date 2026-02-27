@@ -97,6 +97,120 @@ func TestRequestConnection_FastFailNoControlConns(t *testing.T) {
 	}
 }
 
+// TestPingControlConnection_PruneOnFailure verifies that when a keepalive ping
+// write fails (e.g. the underlying TCP connection was silently dropped by a
+// proxy like Istio/Envoy), pingControlConnection removes the dead entry from
+// the registry and closes the connection to unblock the read loop.
+func TestPingControlConnection_PruneOnFailure(t *testing.T) {
+	sp := NewServerProtocol(func(_, _ string) bool { return true })
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	sp.WriteWait = 100 * time.Millisecond          // short write deadline so write fails fast
+	sp.ControlPingInterval = 50 * time.Millisecond // fire ping quickly in test
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverConnCh := make(chan *websocket.Conn, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer ts.Close()
+
+	dialer := websocket.Dialer{}
+	clientConn, _, err := dialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("client dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn := <-serverConnCh
+	ctrlConn := sp.registerControlConnection("svc", serverConn)
+
+	// Close the server-side connection so the next ping write fails immediately.
+	serverConn.Close()
+
+	// Run the ping goroutine; the closed connection should trigger pruning quickly.
+	done := make(chan struct{})
+	defer close(done)
+	go sp.pingControlConnection(done, "svc", ctrlConn)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !sp.hasControlConnections("svc") {
+			return // pruned as expected
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("dead control connection was not pruned by pingControlConnection after write failure")
+}
+
+// TestRequestConnection_FastFailWhenSendPrunesAllConnections verifies that
+// RequestConnection returns well within PendingTimeout when sendToControlConnections
+// removes all control connections (because they were all dead/stale). Previously
+// the code would block for the full 30-second PendingTimeout in this scenario,
+// causing "upstream connect error / connection termination" to be observed by
+// Istio-proxied clients for ~30 seconds before the error was surfaced.
+func TestRequestConnection_FastFailWhenSendPrunesAllConnections(t *testing.T) {
+	sp := NewServerProtocol(func(_, _ string) bool { return true })
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	sp.WriteWait = 100 * time.Millisecond // short deadline so write failure is fast
+	sp.PendingTimeout = 30 * time.Second  // intentionally long; must NOT block this long
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverConnCh := make(chan *websocket.Conn, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer ts.Close()
+
+	dialer := websocket.Dialer{}
+	clientConn, _, err := dialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("client dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	serverConn := <-serverConnCh
+
+	// Register then immediately close the server-side connection.
+	sp.registerControlConnection("svc", serverConn)
+	serverConn.Close()
+
+	incoming, other := net.Pipe()
+	defer other.Close()
+
+	start := time.Now()
+	_, err = sp.RequestConnection("svc", incoming)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error from RequestConnection with dead control connection")
+	}
+	// With WriteWait=100ms the send fails in ~100ms, and the fast-fail path should
+	// return immediately; allow generous headroom but never PendingTimeout (30s).
+	if elapsed >= 2*time.Second {
+		t.Errorf("fast-fail took %v; should be < 2s (must not block for PendingTimeout=30s)", elapsed)
+	}
+}
+
 // TestTransfer_NoSpuriousReadDeadline verifies that the data-connection transfer loop
 // does NOT close an idle-but-valid WebSocket connection simply because PongWait elapsed
 // with no incoming data.  The old code incorrectly set ws.SetReadDeadline on every

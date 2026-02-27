@@ -34,3 +34,20 @@ log_level: "info"
 # Maximum number of concurrent connections.
 # Set to 0 for unlimited connections.
 max_connections: 0
+
+# control_ping_interval (optional, default: 15s)
+# Interval for WebSocket keepalive pings on control connections.
+# IMPORTANT for Istio/Envoy and other service-mesh environments:
+# Reduce this value (e.g. "5s") to be shorter than your proxy's idle-connection
+# timeout. Without this, an idle control connection may be silently dropped by
+# the proxy before the ping fires, causing the first request after idle to fail
+# with "upstream connect error / connection termination".
+# Examples: "5s", "10s", "15s"
+# control_ping_interval: 5s
+
+# write_wait (optional, default: 10s)
+# Deadline for WebSocket write operations on the server side.
+# The server sends a ping; if the remote end is gone and the kernel ACK never
+# arrives within write_wait, the write fails and the dead connection is pruned.
+# Examples: "5s", "10s"
+# write_wait: 10s

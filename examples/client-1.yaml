@@ -40,6 +40,20 @@ reconnect_interval: 5s
 # Set to 0 for unlimited reconnection attempts.
 max_reconnect_attempts: 0
 
+# ping_interval (optional, default: 30s)
+# How often the client sends WebSocket pings on the control connection.
+# IMPORTANT for Istio/Envoy and other service-mesh environments:
+# Set this to a value shorter than your proxy's idle-connection timeout
+# (e.g. "5s") to keep the control WebSocket alive and avoid silent disconnects
+# that cause "upstream connect error / connection termination" on the first
+# request after an idle period.
+# ping_interval: 5s
+
+# pong_timeout (optional, default: 60s)
+# How long to wait for a pong before treating the control connection as dead.
+# Must be greater than ping_interval.
+# pong_timeout: 60s
+
 # log_level (optional, default: "info")
 # Logging verbosity level.
 # Valid values: "debug", "info", "warn", "error"

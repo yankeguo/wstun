@@ -67,6 +67,8 @@ func NewServer(config *wstun.ServerOptions, logger *slog.Logger) (*Server, error
 	server.protocol.RetryAttempts = config.RetryAttempts
 	server.protocol.RetryInterval = config.RetryInterval
 	server.protocol.RetryMaxInterval = config.RetryMaxInterval
+	server.protocol.ControlPingInterval = config.ControlPingInterval
+	server.protocol.WriteWait = config.WriteWait
 
 	return server, nil
 }
