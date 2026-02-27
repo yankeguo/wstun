@@ -376,12 +376,6 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 		}()
 
 		for {
-			select {
-			case <-closeCh:
-				return
-			default:
-			}
-
 			if err := ws.SetReadDeadline(time.Now().Add(cp.PongWait)); err != nil {
 				cp.logf("[%s] Failed to set read deadline: %v", connID, err)
 				return
@@ -391,7 +385,12 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-						cp.logf("[%s] WebSocket read error: %v", connID, err)
+						// Suppress spurious error when closeCh fired and closeWebSocket() raced with ReadMessage
+						select {
+						case <-closeCh:
+						default:
+							cp.logf("[%s] WebSocket read error: %v", connID, err)
+						}
 					}
 				}
 				return
@@ -432,24 +431,22 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 			}
 
 			n, err := target.Read(buf)
+			// Process n bytes BEFORE checking err: Read() can return n>0 and io.EOF
+			// simultaneously on the final chunk; discarding those bytes causes data loss.
+			if n > 0 {
+				if writeErr := ws.SetWriteDeadline(time.Now().Add(cp.WriteWait)); writeErr != nil {
+					cp.logf("[%s] Failed to set write deadline: %v", connID, writeErr)
+					return
+				}
+				if writeErr := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
+					cp.logf("[%s] WebSocket write error: %v", connID, writeErr)
+					return
+				}
+			}
 			if err != nil {
 				if err != io.EOF && !errors.Is(err, context.Canceled) {
 					cp.logf("[%s] Target read error: %v", connID, err)
 				}
-				return
-			}
-
-			if n <= 0 {
-				continue
-			}
-
-			if err := ws.SetWriteDeadline(time.Now().Add(cp.WriteWait)); err != nil {
-				cp.logf("[%s] Failed to set write deadline: %v", connID, err)
-				return
-			}
-
-			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				cp.logf("[%s] WebSocket write error: %v", connID, err)
 				return
 			}
 		}

@@ -270,21 +270,19 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := incoming.Read(buf)
+			// Process n bytes BEFORE checking err: Read() can return n>0 and io.EOF
+			// simultaneously on the final chunk; discarding those bytes causes data loss.
+			if n > 0 {
+				if writeErr := outgoing.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
+					if shouldLog(s.config.LogLevel, "debug") {
+						s.logger.Printf("Outgoing write error: %v", writeErr)
+					}
+					return
+				}
+			}
 			if err != nil {
 				if err != io.EOF && shouldLog(s.config.LogLevel, "debug") {
 					s.logger.Printf("Incoming read error: %v", err)
-				}
-				return
-			}
-
-			// Handle zero-length reads
-			if n <= 0 {
-				continue
-			}
-
-			if err := outgoing.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				if shouldLog(s.config.LogLevel, "debug") {
-					s.logger.Printf("Outgoing write error: %v", err)
 				}
 				return
 			}
