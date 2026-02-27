@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -71,8 +71,8 @@ type ServerProtocol struct {
 	// Defaults to 10 seconds.
 	WriteWait time.Duration
 
-	// Logger for protocol events (optional)
-	Logger *log.Logger
+	// Logger for protocol events (optional, falls back to slog.Default())
+	Logger *slog.Logger
 
 	upgrader websocket.Upgrader
 
@@ -125,14 +125,16 @@ func (sp *ServerProtocol) HandleWebSocket(w http.ResponseWriter, r *http.Request
 
 	if sp.AuthFunc == nil || !sp.AuthFunc(serviceName, serviceToken) {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		sp.logf("Authentication failed for service: %s", serviceName)
+		sp.logger().Error("authentication failed", "service", serviceName)
 		return
 	}
+
+	log := sp.logger().With("service", serviceName)
 
 	// Upgrade to WebSocket
 	conn, err := sp.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		sp.logf("WebSocket upgrade failed: %v", err)
+		log.Error("websocket upgrade failed", "error", err)
 		return
 	}
 
@@ -140,7 +142,7 @@ func (sp *ServerProtocol) HandleWebSocket(w http.ResponseWriter, r *http.Request
 	messageType, message, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
-		sp.logf("Failed to read first message: %v", err)
+		log.Error("failed to read first message", "error", err)
 		return
 	}
 
@@ -149,7 +151,7 @@ func (sp *ServerProtocol) HandleWebSocket(w http.ResponseWriter, r *http.Request
 			websocket.FormatCloseMessage(websocket.CloseUnsupportedData, "First message must be text"),
 			time.Now().Add(time.Second))
 		conn.Close()
-		sp.logf("Invalid first message type from service %s", serviceName)
+		log.Error("invalid first message type")
 		return
 	}
 
@@ -165,21 +167,22 @@ func (sp *ServerProtocol) HandleWebSocket(w http.ResponseWriter, r *http.Request
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Unrecognized first message"),
 			time.Now().Add(time.Second))
 		conn.Close()
-		sp.logf("Unrecognized first message from service %s: %s", serviceName, messageStr)
+		log.Error("unrecognized first message", "message", messageStr)
 	}
 }
 
 func (sp *ServerProtocol) handleControlConnection(conn *websocket.Conn, serviceName string) {
-	sp.logf("Control connection established for service: %s", serviceName)
+	log := sp.logger().With("service", serviceName)
+	log.Info("control connection established")
 
 	// Register control connection and retain the wrapper for the ping goroutine.
-	cc := sp.registerControlConnection(serviceName, conn)
+	ctrlConn := sp.registerControlConnection(serviceName, conn)
 	defer sp.unregisterControlConnection(serviceName, conn)
 
 	// Start keepalive ping goroutine; close done when this function exits.
 	doneCh := make(chan struct{})
 	defer close(doneCh)
-	go sp.pingControlConnection(doneCh, serviceName, cc)
+	go sp.pingControlConnection(doneCh, serviceName, ctrlConn)
 
 	// Delegate to handler if provided
 	if sp.ControlHandler != nil {
@@ -194,11 +197,12 @@ func (sp *ServerProtocol) handleControlConnection(conn *websocket.Conn, serviceN
 		}
 	}
 
-	sp.logf("Control connection closed for service: %s", serviceName)
+	log.Info("control connection closed")
 }
 
 func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName string, connID string) {
-	sp.logf("Data connection received for service %s, connection ID: %s", serviceName, connID)
+	log := sp.logger().With("service", serviceName, "conn_id", connID)
+	log.Info("data connection received")
 
 	// Atomically load and delete pending connection
 	value, loaded := sp.pendingConns.LoadAndDelete(connID)
@@ -207,7 +211,7 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Unknown connection ID"),
 			time.Now().Add(time.Second))
 		conn.Close()
-		sp.logf("Unknown connection ID: %s", connID)
+		log.Error("unknown connection ID")
 		return
 	}
 
@@ -220,28 +224,28 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 			time.Now().Add(time.Second))
 		conn.Close()
 		pending.incoming.Close()
-		sp.logf("Connection ID %s does not belong to service %s", connID, serviceName)
+		log.Error("connection ID does not belong to service")
 		return
 	}
 
 	// Cancel timeout
 	pending.cancel()
 
-	sp.logf("Data connection matched for service %s, connection ID: %s", serviceName, connID)
+	log.Info("data connection matched")
 
 	// Delegate to handler
 	if sp.DataHandler != nil {
 		// Use defer/recover to catch panics in handler
 		defer func() {
 			if r := recover(); r != nil {
-				sp.logf("Panic in DataHandler for connection %s: %v", connID, r)
+				log.Error("panic in DataHandler", "panic", r)
 			}
 			conn.Close()
 			pending.incoming.Close()
 		}()
 		sp.DataHandler(pending.incoming, conn)
 	} else {
-		sp.logf("No DataHandler configured, closing connection: %s", connID)
+		log.Warn("no DataHandler configured, closing connection")
 		conn.Close()
 		pending.incoming.Close()
 	}
@@ -252,17 +256,21 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 // to establish a matching data connection. Supports exponential-backoff retry when
 // RetryAttempts > 0. Closes incoming and returns an error when all attempts are exhausted.
 func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.ReadWriteCloser) (string, error) {
+	log := sp.logger().With("service", serviceName)
+
 	// Generate connection ID (same ULID is reused across all retry attempts)
 	connID, err := GenerateConnectionID()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate connection ID: %w", err)
 	}
 
+	log = log.With("conn_id", connID)
+
 	for attempt := 0; ; attempt++ {
 		// Fast-fail if no control connections are registered: avoid spending PendingTimeout
 		// waiting for a HANDLE that will never come.
 		if !sp.hasControlConnections(serviceName) {
-			sp.logf("No control connections available for service %s (attempt %d)", serviceName, attempt+1)
+			log.Warn("no control connections available", "attempt", attempt+1)
 			if attempt >= sp.RetryAttempts {
 				incoming.Close()
 				return "", fmt.Errorf("connection request failed after %d attempt(s): no control connections", attempt+1)
@@ -290,7 +298,7 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			timedOut := ctx.Err() == context.DeadlineExceeded
 			if timedOut {
 				sp.pendingConns.Delete(connID)
-				sp.logf("Connection timeout for pending connection: %s", connID)
+				log.Warn("connection timeout for pending connection")
 			}
 			timeoutChan <- timedOut
 		}()
@@ -299,9 +307,9 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 		sp.sendToControlConnections(serviceName, FormatConnectMessage(connID))
 
 		if attempt == 0 {
-			sp.logf("Connection request sent to service %s with ID: %s", serviceName, connID)
+			log.Info("connection request sent")
 		} else {
-			sp.logf("Retrying connection request for service %s with ID: %s (attempt %d/%d)", serviceName, connID, attempt, sp.RetryAttempts)
+			log.Info("retrying connection request", "attempt", attempt, "max_attempts", sp.RetryAttempts)
 		}
 
 		// Wait for the data connection handler to cancel the context (success)
@@ -328,7 +336,7 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 				break
 			}
 		}
-		sp.logf("Waiting %v before retry %d/%d for connection %s", retryDelay, attempt+1, sp.RetryAttempts, connID)
+		log.Info("waiting before retry", "delay", retryDelay, "attempt", attempt+1, "max_attempts", sp.RetryAttempts)
 		time.Sleep(retryDelay)
 	}
 }
@@ -371,7 +379,8 @@ func (sp *ServerProtocol) hasControlConnections(serviceName string) bool {
 // pingControlConnection sends periodic WebSocket ping frames on a control connection
 // to prevent proxy idle-timeout from silently resetting it.
 // It exits when done is closed or a write fails.
-func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceName string, cc *controlConnection) {
+func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceName string, ctrlConn *controlConnection) {
+	log := sp.logger().With("service", serviceName)
 	interval := sp.ControlPingInterval
 	if interval <= 0 {
 		interval = 15 * time.Second
@@ -383,11 +392,11 @@ func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceNam
 		case <-done:
 			return
 		case <-ticker.C:
-			cc.writeMu.Lock()
-			err := cc.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(sp.WriteWait))
-			cc.writeMu.Unlock()
+			ctrlConn.writeMu.Lock()
+			err := ctrlConn.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(sp.WriteWait))
+			ctrlConn.writeMu.Unlock()
 			if err != nil {
-				sp.logf("Keepalive ping failed for service %s: %v", serviceName, err)
+				log.Warn("keepalive ping failed", "error", err)
 				return
 			}
 		}
@@ -412,31 +421,35 @@ func (sp *ServerProtocol) unregisterControlConnection(serviceName string, conn *
 }
 
 func (sp *ServerProtocol) sendToControlConnections(serviceName string, message string) {
+	log := sp.logger().With("service", serviceName)
+
 	value, ok := sp.controlConns.Load(serviceName)
 	if !ok {
-		sp.logf("No control connections for service: %s", serviceName)
+		log.Warn("no control connections for service")
 		return
 	}
 
 	conns := value.(*sync.Map)
 	conns.Range(func(key, _ interface{}) bool {
-		cc := key.(*controlConnection)
+		ctrlConn := key.(*controlConnection)
 		// Use mutex to protect concurrent writes; set write deadline to prevent hangs.
-		cc.writeMu.Lock()
-		cc.conn.SetWriteDeadline(time.Now().Add(sp.WriteWait))
-		err := cc.conn.WriteMessage(websocket.TextMessage, []byte(message))
-		cc.writeMu.Unlock()
+		ctrlConn.writeMu.Lock()
+		ctrlConn.conn.SetWriteDeadline(time.Now().Add(sp.WriteWait))
+		err := ctrlConn.conn.WriteMessage(websocket.TextMessage, []byte(message))
+		ctrlConn.writeMu.Unlock()
 
 		if err != nil {
-			sp.logf("Failed to send message to control connection, removing stale entry: %v", err)
-			sp.removeControlConnection(serviceName, cc)
+			log.Error("failed to send message to control connection, removing stale entry", "error", err)
+			sp.removeControlConnection(serviceName, ctrlConn)
 		}
 		return true
 	})
 }
 
-func (sp *ServerProtocol) logf(format string, args ...interface{}) {
+// logger returns the configured logger or slog.Default().
+func (sp *ServerProtocol) logger() *slog.Logger {
 	if sp.Logger != nil {
-		sp.Logger.Printf("[ServerProtocol] "+format, args...)
+		return sp.Logger
 	}
+	return slog.Default()
 }

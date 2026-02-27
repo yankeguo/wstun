@@ -91,7 +91,7 @@ func TestServerCommand_MissingConfigFile(t *testing.T) {
 	}
 
 	outputStr := string(output)
-	if !strings.Contains(outputStr, "Failed to load configuration") {
+	if !strings.Contains(outputStr, "failed to load configuration") {
 		t.Errorf("expected error about failed configuration loading, got: %s", outputStr)
 	}
 }
@@ -106,7 +106,7 @@ func TestClientCommand_MissingConfigFile(t *testing.T) {
 	}
 
 	outputStr := string(output)
-	if !strings.Contains(outputStr, "Failed to load configuration") {
+	if !strings.Contains(outputStr, "failed to load configuration") {
 		t.Errorf("expected error about failed configuration loading, got: %s", outputStr)
 	}
 }

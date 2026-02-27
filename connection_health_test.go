@@ -2,7 +2,7 @@ package wstun
 
 import (
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +18,7 @@ import (
 // This prevents CONNECT messages from being silently dropped into a dead connection.
 func TestSendToControlConnections_PrunesDeadConn(t *testing.T) {
 	sp := NewServerProtocol(func(_, _ string) bool { return true })
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	sp.WriteWait = 100 * time.Millisecond // short deadline so the write fails quickly
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -78,7 +78,7 @@ func TestSendToControlConnections_PrunesDeadConn(t *testing.T) {
 // registered for the target service.
 func TestRequestConnection_FastFailNoControlConns(t *testing.T) {
 	sp := NewServerProtocol(func(_, _ string) bool { return true })
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	sp.RetryAttempts = 0
 	sp.PendingTimeout = 30 * time.Second // intentionally long; must NOT block this long
 
@@ -134,7 +134,7 @@ func TestTransfer_NoSpuriousReadDeadline(t *testing.T) {
 	defer transferB.Close()
 
 	cp := NewClientProtocol("ws://unused", "svc", "tok")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	cp.PongWait = 100 * time.Millisecond // very short - old code would have fired a read deadline
 	cp.WriteWait = time.Second
 

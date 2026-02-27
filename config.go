@@ -2,6 +2,7 @@ package wstun
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +14,16 @@ import (
 
 // validLogLevels is the shared set of accepted log level strings.
 var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+
+// SlogLevel returns the slog.Level corresponding to the LogLevel string in ServerOptions.
+func (o *ServerOptions) SlogLevel() slog.Level {
+	return ParseLogLevel(o.LogLevel)
+}
+
+// SlogLevel returns the slog.Level corresponding to the LogLevel string in ClientOptions.
+func (o *ClientOptions) SlogLevel() slog.Level {
+	return ParseLogLevel(o.LogLevel)
+}
 
 // ServiceDefinition represents a single service configuration on the server.
 type ServiceDefinition struct {

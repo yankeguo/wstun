@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -175,7 +175,7 @@ func TestServerProtocolAuth(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create test HTTP server
 	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
@@ -213,7 +213,7 @@ func TestServerProtocolAuth(t *testing.T) {
 			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 
 			cp := NewClientProtocol(wsURL, tt.serviceName, tt.serviceToken)
-			cp.Logger = log.New(io.Discard, "", 0)
+			cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 			// Try to connect in goroutine with timeout
 			errCh := make(chan error, 1)
@@ -247,7 +247,7 @@ func TestProtocolFlow(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Track connections
 	var dataHandlerCalled sync.WaitGroup
@@ -274,7 +274,7 @@ func TestProtocolFlow(t *testing.T) {
 
 	// Start client
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Set up connect handler
 	cp.ConnectHandler = func(ctx context.Context, connID string) (io.ReadWriteCloser, error) {
@@ -335,7 +335,7 @@ func TestConnectionTimeout(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	sp.PendingTimeout = 200 * time.Millisecond // Short timeout for testing
 
 	// Create test HTTP server
@@ -346,7 +346,7 @@ func TestConnectionTimeout(t *testing.T) {
 
 	// Start client but don't handle CONNECT messages
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	cp.ConnectHandler = nil // No handler, so CONNECT will be ignored
 
 	go cp.Start()
@@ -389,7 +389,7 @@ func TestConcurrentConnections(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	var handleCount sync.WaitGroup
 	var handleMutex sync.Mutex
@@ -410,7 +410,7 @@ func TestConcurrentConnections(t *testing.T) {
 
 	// Start client
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	cp.ConnectHandler = func(ctx context.Context, connID string) (io.ReadWriteCloser, error) {
 		handleMutex.Lock()
@@ -556,7 +556,7 @@ func TestRequestConnectionNoRetry(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	sp.PendingTimeout = 100 * time.Millisecond
 	sp.RetryAttempts = 0 // No retry
 
@@ -568,7 +568,7 @@ func TestRequestConnectionNoRetry(t *testing.T) {
 
 	// Start client but don't handle CONNECT messages
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	cp.ConnectHandler = nil
 
 	go cp.Start()
@@ -610,7 +610,7 @@ func TestRequestConnectionRetryExhausted(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	sp.PendingTimeout = 100 * time.Millisecond
 	sp.RetryAttempts = 2
 	sp.RetryInterval = 50 * time.Millisecond
@@ -624,7 +624,7 @@ func TestRequestConnectionRetryExhausted(t *testing.T) {
 
 	// Start client but don't handle CONNECT messages
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	cp.ConnectHandler = nil
 
 	go cp.Start()
@@ -670,7 +670,7 @@ func TestRequestConnectionRetrySuccess(t *testing.T) {
 	}
 
 	sp := NewServerProtocol(authFunc)
-	sp.Logger = log.New(io.Discard, "", 0)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	sp.PendingTimeout = 200 * time.Millisecond
 	sp.RetryAttempts = 3
 	sp.RetryInterval = 100 * time.Millisecond
@@ -693,7 +693,7 @@ func TestRequestConnectionRetrySuccess(t *testing.T) {
 
 	// Start client with immediate handler (no delay)
 	cp := NewClientProtocol(wsURL, "test-service", "test-token")
-	cp.Logger = log.New(io.Discard, "", 0)
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	var connectCount int32
 	cp.ConnectHandler = func(ctx context.Context, connID string) (io.ReadWriteCloser, error) {
