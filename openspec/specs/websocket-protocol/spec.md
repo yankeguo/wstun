@@ -106,13 +106,13 @@ The server SHALL provide a single path-agnostic WebSocket endpoint that handles 
 
 - **WHEN** server receives first message that is not a text frame
 - **THEN** server closes the WebSocket connection with error
-- **AND** logs the invalid message type
+- **AND** logs the invalid message type via `slog` at error level with `"service"` attribute
 
 #### Scenario: Unrecognized first message content
 
 - **WHEN** server reads first text message that is neither "WAITING" nor starts with "HANDLE:"
 - **THEN** server closes the WebSocket connection with error
-- **AND** logs the unrecognized message content
+- **AND** logs the unrecognized message content via `slog` at error level with `"service"` attribute
 
 ### Requirement: Server Initial Connection Handling
 
@@ -280,7 +280,7 @@ The system SHALL properly manage WebSocket connection lifecycle including closur
 #### Scenario: WebSocket error handling
 
 - **WHEN** WebSocket error occurs on any connection
-- **THEN** error is logged with connection context
+- **THEN** error is logged as a structured `slog` entry at error level with `"service"` and `"conn_id"` attributes where applicable
 - **AND** connection is closed gracefully if possible
 - **AND** resources are cleaned up
 
@@ -329,20 +329,20 @@ The system SHALL handle errors gracefully without crashing or leaking resources.
 #### Scenario: Nil handler protection
 
 - **WHEN** ConnectHandler or DataHandler is nil
-- **THEN** system logs warning and gracefully skips operation
+- **THEN** system logs warning via `slog` at warn level and gracefully skips operation
 - **AND** does not panic with nil pointer dereference
 
 #### Scenario: Panic recovery in goroutines
 
 - **WHEN** unexpected panic occurs in data transfer goroutine
 - **THEN** system recovers from panic using defer/recover
-- **AND** logs panic details for debugging
+- **AND** logs panic details via `slog` at error level with `"conn_id"` attribute
 - **AND** closes associated connections
 
 #### Scenario: Write to closed connection
 
 - **WHEN** system attempts to write to already-closed WebSocket
-- **THEN** error is caught and logged
+- **THEN** error is caught and logged via `slog` at error level
 - **AND** system does not crash
 - **AND** associated resources are cleaned up
 
