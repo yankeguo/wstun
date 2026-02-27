@@ -9,16 +9,7 @@ import (
 // Accepted values (case-insensitive): "debug", "info", "warn", "error".
 // Returns slog.LevelInfo for empty or unrecognised input.
 func ParseLogLevel(s string) slog.Level {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "debug":
-		return slog.LevelDebug
-	case "info":
-		return slog.LevelInfo
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
+	var l slog.Level
+	l.UnmarshalText([]byte(strings.TrimSpace(s)))
+	return l
 }
