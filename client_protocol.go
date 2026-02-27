@@ -376,11 +376,6 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 		}()
 
 		for {
-			if err := ws.SetReadDeadline(time.Now().Add(cp.PongWait)); err != nil {
-				cp.logf("[%s] Failed to set read deadline: %v", connID, err)
-				return
-			}
-
 			messageType, data, err := ws.ReadMessage()
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {

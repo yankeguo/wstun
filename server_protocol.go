@@ -63,6 +63,14 @@ type ServerProtocol struct {
 	// RetryMaxInterval is the maximum retry interval
 	RetryMaxInterval time.Duration
 
+	// ControlPingInterval is the interval for server-side keepalive pings on control connections.
+	// Defaults to 15 seconds.
+	ControlPingInterval time.Duration
+
+	// WriteWait is the write deadline applied to all server-side WebSocket writes.
+	// Defaults to 10 seconds.
+	WriteWait time.Duration
+
 	// Logger for protocol events (optional)
 	Logger *log.Logger
 
@@ -90,11 +98,13 @@ type controlConnection struct {
 // NewServerProtocol creates a new server protocol handler.
 func NewServerProtocol(authFunc ServiceAuthFunc) *ServerProtocol {
 	return &ServerProtocol{
-		AuthFunc:         authFunc,
-		PendingTimeout:   30 * time.Second,
-		RetryAttempts:    0,
-		RetryInterval:    5 * time.Second,
-		RetryMaxInterval: 60 * time.Second,
+		AuthFunc:            authFunc,
+		PendingTimeout:      30 * time.Second,
+		RetryAttempts:       0,
+		RetryInterval:       5 * time.Second,
+		RetryMaxInterval:    60 * time.Second,
+		ControlPingInterval: 15 * time.Second,
+		WriteWait:           10 * time.Second,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Accept all origins; security is via BasicAuth
@@ -162,9 +172,14 @@ func (sp *ServerProtocol) HandleWebSocket(w http.ResponseWriter, r *http.Request
 func (sp *ServerProtocol) handleControlConnection(conn *websocket.Conn, serviceName string) {
 	sp.logf("Control connection established for service: %s", serviceName)
 
-	// Register control connection
-	sp.registerControlConnection(serviceName, conn)
+	// Register control connection and retain the wrapper for the ping goroutine.
+	cc := sp.registerControlConnection(serviceName, conn)
 	defer sp.unregisterControlConnection(serviceName, conn)
+
+	// Start keepalive ping goroutine; close done when this function exits.
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+	go sp.pingControlConnection(doneCh, serviceName, cc)
 
 	// Delegate to handler if provided
 	if sp.ControlHandler != nil {
@@ -244,6 +259,18 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 	}
 
 	for attempt := 0; ; attempt++ {
+		// Fast-fail if no control connections are registered: avoid spending PendingTimeout
+		// waiting for a HANDLE that will never come.
+		if !sp.hasControlConnections(serviceName) {
+			sp.logf("No control connections available for service %s (attempt %d)", serviceName, attempt+1)
+			if attempt >= sp.RetryAttempts {
+				incoming.Close()
+				return "", fmt.Errorf("connection request failed after %d attempt(s): no control connections", attempt+1)
+			}
+			// Count as a failed attempt without sleeping; move on immediately.
+			continue
+		}
+
 		// Create a fresh timeout context for each attempt
 		ctx, cancel := context.WithTimeout(context.Background(), sp.PendingTimeout)
 		pending := &pendingConnection{
@@ -306,11 +333,65 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 	}
 }
 
-func (sp *ServerProtocol) registerControlConnection(serviceName string, conn *websocket.Conn) {
+func (sp *ServerProtocol) registerControlConnection(serviceName string, conn *websocket.Conn) *controlConnection {
 	value, _ := sp.controlConns.LoadOrStore(serviceName, &sync.Map{})
 	conns := value.(*sync.Map)
 	cc := &controlConnection{conn: conn}
 	conns.Store(cc, struct{}{})
+	return cc
+}
+
+// removeControlConnection removes a specific control connection wrapper from the registry.
+// It is safe to call concurrently; deleting an already-deleted key is a no-op.
+func (sp *ServerProtocol) removeControlConnection(serviceName string, cc *controlConnection) {
+	value, ok := sp.controlConns.Load(serviceName)
+	if !ok {
+		return
+	}
+	conns := value.(*sync.Map)
+	conns.Delete(cc)
+}
+
+// hasControlConnections reports whether at least one control connection is
+// currently registered for the given service.
+func (sp *ServerProtocol) hasControlConnections(serviceName string) bool {
+	value, ok := sp.controlConns.Load(serviceName)
+	if !ok {
+		return false
+	}
+	conns := value.(*sync.Map)
+	found := false
+	conns.Range(func(_, _ interface{}) bool {
+		found = true
+		return false // stop at first entry
+	})
+	return found
+}
+
+// pingControlConnection sends periodic WebSocket ping frames on a control connection
+// to prevent proxy idle-timeout from silently resetting it.
+// It exits when done is closed or a write fails.
+func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceName string, cc *controlConnection) {
+	interval := sp.ControlPingInterval
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			cc.writeMu.Lock()
+			err := cc.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(sp.WriteWait))
+			cc.writeMu.Unlock()
+			if err != nil {
+				sp.logf("Keepalive ping failed for service %s: %v", serviceName, err)
+				return
+			}
+		}
+	}
 }
 
 func (sp *ServerProtocol) unregisterControlConnection(serviceName string, conn *websocket.Conn) {
@@ -340,14 +421,15 @@ func (sp *ServerProtocol) sendToControlConnections(serviceName string, message s
 	conns := value.(*sync.Map)
 	conns.Range(func(key, _ interface{}) bool {
 		cc := key.(*controlConnection)
-		// Use mutex to protect concurrent writes
+		// Use mutex to protect concurrent writes; set write deadline to prevent hangs.
 		cc.writeMu.Lock()
+		cc.conn.SetWriteDeadline(time.Now().Add(sp.WriteWait))
 		err := cc.conn.WriteMessage(websocket.TextMessage, []byte(message))
 		cc.writeMu.Unlock()
 
 		if err != nil {
-			sp.logf("Failed to send message to control connection: %v", err)
-			// Don't remove connection here as it might cause concurrent map modification
+			sp.logf("Failed to send message to control connection, removing stale entry: %v", err)
+			sp.removeControlConnection(serviceName, cc)
 		}
 		return true
 	})
