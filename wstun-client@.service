@@ -1,0 +1,13 @@
+[Unit]
+Description=wstun-client instance (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wstun-client -c /etc/wstun-client/%i.yml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
