@@ -40,7 +40,7 @@ wstun/
 ├── Dockerfile.client        # 客户端镜像
 ├── wstun-client@.service    # systemd 模板单元（配置路径 /etc/wstun-client/%i.yml）
 ├── .cnb.yml                 # cnb.cool CI 流水线
-└── README.md                # 完整中文用户文档（配置详解、示例、FAQ、更新日志）
+└── README.md                # 完整中文用户文档（配置详解、示例、FAQ）
 ```
 
 ## 构建与测试命令
@@ -110,6 +110,6 @@ go vet ./...
 
 修改配置项、协议行为或命令行用法时，同步更新：
 
-- `README.md`（中文，含配置表格、示例、更新日志）
+- `README.md`（中文，含配置表格、示例）
 - `examples/` 下相关 YAML 文件的注释
 - 本文件 `AGENTS.md`（如结构或约定发生变化）
