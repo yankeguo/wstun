@@ -2,7 +2,6 @@ package wstun
 
 import (
 	"fmt"
-	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,16 +13,6 @@ import (
 
 // validLogLevels is the shared set of accepted log level strings.
 var validLogLevels = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
-
-// SlogLevel returns the slog.Level corresponding to the LogLevel string in ServerOptions.
-func (o *ServerOptions) SlogLevel() slog.Level {
-	return ParseLogLevel(o.LogLevel)
-}
-
-// SlogLevel returns the slog.Level corresponding to the LogLevel string in ClientOptions.
-func (o *ClientOptions) SlogLevel() slog.Level {
-	return ParseLogLevel(o.LogLevel)
-}
 
 // ServiceDefinition represents a single service configuration on the server.
 type ServiceDefinition struct {
@@ -215,13 +204,8 @@ func (o *ClientOptions) Validate() error {
 		return fmt.Errorf("server_url must use ws:// or wss:// scheme, got: %s://", parsedURL.Scheme)
 	}
 
-	if o.ServiceName == "" {
-		return fmt.Errorf("service_name is required")
-	}
-
-	// Trim whitespace and validate service name is not empty after trimming
-	trimmedName := strings.TrimSpace(o.ServiceName)
-	if trimmedName == "" {
+	// Validate service name is not empty or whitespace-only
+	if strings.TrimSpace(o.ServiceName) == "" {
 		return fmt.Errorf("service_name cannot be empty or whitespace-only")
 	}
 
@@ -236,7 +220,7 @@ func (o *ClientOptions) Validate() error {
 		return fmt.Errorf("service_name cannot start or end with hyphen")
 	}
 	for _, r := range o.ServiceName {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+		if !isValidServiceNameChar(r) {
 			return fmt.Errorf("service_name must contain only alphanumeric characters, hyphens, and underscores")
 		}
 	}
@@ -300,16 +284,16 @@ func (o *ClientOptions) SetDefaults() {
 	}
 }
 
+// isValidServiceNameChar reports whether r is allowed in a service name.
+func isValidServiceNameChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+}
+
 // LoadServerConfig loads and validates ServerOptions from a YAML file.
 func LoadServerConfig(path string) (*ServerOptions, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
 	var opts ServerOptions
-	if err := yaml.Unmarshal(data, &opts); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	if err := loadYAMLFile(path, &opts); err != nil {
+		return nil, err
 	}
 
 	opts.SetDefaults()
@@ -323,14 +307,9 @@ func LoadServerConfig(path string) (*ServerOptions, error) {
 
 // LoadClientConfig loads and validates ClientOptions from a YAML file.
 func LoadClientConfig(path string) (*ClientOptions, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
 	var opts ClientOptions
-	if err := yaml.Unmarshal(data, &opts); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	if err := loadYAMLFile(path, &opts); err != nil {
+		return nil, err
 	}
 
 	opts.SetDefaults()
@@ -344,14 +323,9 @@ func LoadClientConfig(path string) (*ClientOptions, error) {
 
 // LoadServiceDefinition loads and validates a ServiceDefinition from a YAML file.
 func LoadServiceDefinition(path string) (*ServiceDefinition, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read service definition file: %w", err)
-	}
-
 	var service ServiceDefinition
-	if err := yaml.Unmarshal(data, &service); err != nil {
-		return nil, fmt.Errorf("failed to parse service YAML: %w", err)
+	if err := loadYAMLFile(path, &service); err != nil {
+		return nil, err
 	}
 
 	if err := service.Validate(); err != nil {
@@ -359,6 +333,18 @@ func LoadServiceDefinition(path string) (*ServiceDefinition, error) {
 	}
 
 	return &service, nil
+}
+
+// loadYAMLFile reads a YAML file and unmarshals it into v.
+func loadYAMLFile(path string, v any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+	if err := yaml.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	return nil
 }
 
 // LoadAllServices loads all service definitions from a directory.

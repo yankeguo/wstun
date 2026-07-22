@@ -27,8 +27,14 @@ var (
 	ErrConnectionTimeout = errors.New("connection timeout")
 )
 
+// Default server-side timing parameters.
+const (
+	defaultControlPingInterval = 15 * time.Second
+	defaultServerWriteWait     = 10 * time.Second
+)
+
 // ServiceAuthFunc is a function type for authenticating service credentials.
-// Returns the service name if authentication succeeds, empty string otherwise.
+// Returns true if the credentials are valid, false otherwise.
 type ServiceAuthFunc func(serviceName, serviceToken string) bool
 
 // ControlConnectionHandler is called when a control connection (WAITING) is established.
@@ -103,8 +109,8 @@ func NewServerProtocol(authFunc ServiceAuthFunc) *ServerProtocol {
 		RetryAttempts:       0,
 		RetryInterval:       5 * time.Second,
 		RetryMaxInterval:    60 * time.Second,
-		ControlPingInterval: 15 * time.Second,
-		WriteWait:           10 * time.Second,
+		ControlPingInterval: defaultControlPingInterval,
+		WriteWait:           defaultServerWriteWait,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Accept all origins; security is via BasicAuth
@@ -177,7 +183,7 @@ func (sp *ServerProtocol) handleControlConnection(conn *websocket.Conn, serviceN
 
 	// Register control connection and retain the wrapper for the ping goroutine.
 	ctrlConn := sp.registerControlConnection(serviceName, conn)
-	defer sp.unregisterControlConnection(serviceName, conn)
+	defer sp.removeControlConnection(serviceName, ctrlConn)
 
 	// Start keepalive ping goroutine; close done when this function exits.
 	doneCh := make(chan struct{})
@@ -397,7 +403,7 @@ func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceNam
 	log := sp.logger().With("service", serviceName)
 	interval := sp.ControlPingInterval
 	if interval <= 0 {
-		interval = 15 * time.Second
+		interval = defaultControlPingInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -424,23 +430,6 @@ func (sp *ServerProtocol) pingControlConnection(done <-chan struct{}, serviceNam
 	}
 }
 
-func (sp *ServerProtocol) unregisterControlConnection(serviceName string, conn *websocket.Conn) {
-	value, ok := sp.controlConns.Load(serviceName)
-	if !ok {
-		return
-	}
-	conns := value.(*sync.Map)
-	// Find and remove the control connection wrapper
-	conns.Range(func(key, _ interface{}) bool {
-		cc := key.(*controlConnection)
-		if cc.conn == conn {
-			conns.Delete(key)
-			return false // stop iteration
-		}
-		return true
-	})
-}
-
 func (sp *ServerProtocol) sendToControlConnections(serviceName string, message string) {
 	log := sp.logger().With("service", serviceName)
 
@@ -455,7 +444,9 @@ func (sp *ServerProtocol) sendToControlConnections(serviceName string, message s
 		ctrlConn := key.(*controlConnection)
 		// Use mutex to protect concurrent writes; set write deadline to prevent hangs.
 		ctrlConn.writeMu.Lock()
-		ctrlConn.conn.SetWriteDeadline(time.Now().Add(sp.WriteWait))
+		if err := ctrlConn.conn.SetWriteDeadline(time.Now().Add(sp.WriteWait)); err != nil {
+			log.Debug("failed to set write deadline on control connection", "error", err)
+		}
 		err := ctrlConn.conn.WriteMessage(websocket.TextMessage, []byte(message))
 		ctrlConn.writeMu.Unlock()
 

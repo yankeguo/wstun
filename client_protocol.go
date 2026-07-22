@@ -16,15 +16,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var (
-	ErrClientStopped = errors.New("client stopped")
-)
-
 const (
 	defaultPingInterval     = 30 * time.Second
 	defaultPongWait         = 60 * time.Second
 	defaultWriteWait        = 10 * time.Second
-	defaultReadTimeout      = 0
+	connectHandlerTimeout   = 30 * time.Second
 	dataConnectMaxRetries   = 3
 	dataConnectRetryDelay   = 500 * time.Millisecond
 	gracefulShutdownTimeout = 5 * time.Second
@@ -49,14 +45,14 @@ type ClientProtocol struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
-	activeConns  int64
+	activeConns  atomic.Int64
 	shutdownMode atomic.Bool
 }
 
 // NewClientProtocol creates a new client protocol handler.
 func NewClientProtocol(serverURL, serviceName, serviceToken string) *ClientProtocol {
 	ctx, cancel := context.WithCancel(context.Background())
-	cp := &ClientProtocol{
+	return &ClientProtocol{
 		ServerURL:    serverURL,
 		ServiceName:  serviceName,
 		ServiceToken: serviceToken,
@@ -67,7 +63,6 @@ func NewClientProtocol(serverURL, serviceName, serviceToken string) *ClientProto
 		ctx:          ctx,
 		cancel:       cancel,
 	}
-	return cp
 }
 
 // logger returns the configured logger (with "service" attribute) or slog.Default().
@@ -131,14 +126,9 @@ func (cp *ClientProtocol) pingLoop(conn *websocket.Conn) {
 		case <-cp.ctx.Done():
 			return
 		case <-ticker.C:
-			cp.controlMu.Lock()
-			if cp.controlConn == nil {
-				cp.controlMu.Unlock()
-				return
-			}
-			err := cp.controlConn.WriteControl(websocket.PingMessage, nil, time.Now().Add(cp.WriteWait))
-			cp.controlMu.Unlock()
-			if err != nil {
+			// WriteControl is safe for concurrent use with all other methods,
+			// so no controlMu is needed here.
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(cp.WriteWait)); err != nil {
 				cp.logger().Warn("ping failed", "error", err)
 				return
 			}
@@ -190,7 +180,7 @@ func (cp *ClientProtocol) Stop() error {
 func (cp *ClientProtocol) WaitForActiveConnections(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt64(&cp.activeConns) == 0 {
+		if cp.activeConns.Load() == 0 {
 			return true
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -287,10 +277,10 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 		return
 	}
 
-	atomic.AddInt64(&cp.activeConns, 1)
-	defer atomic.AddInt64(&cp.activeConns, -1)
+	cp.activeConns.Add(1)
+	defer cp.activeConns.Add(-1)
 
-	ctx, cancel := context.WithTimeout(cp.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(cp.ctx, connectHandlerTimeout)
 	defer cancel()
 
 	target, err := cp.ConnectHandler(ctx, connID)

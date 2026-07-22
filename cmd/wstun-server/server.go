@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// shutdownTimeout bounds graceful shutdown phases (HTTP server and goroutines).
+const shutdownTimeout = 10 * time.Second
+
 // Server encapsulates the server state and operations.
 type Server struct {
 	config      *wstun.ServerOptions
@@ -24,7 +28,7 @@ type Server struct {
 	listeners   map[string]net.Listener
 	httpServer  *http.Server
 	logger      *slog.Logger
-	activeConns int32
+	activeConns atomic.Int32
 	shutdown    chan struct{}
 	wg          sync.WaitGroup
 }
@@ -115,7 +119,7 @@ func (s *Server) Start() error {
 			s.logger.Info("websocket server starting", "addr", s.config.ListenAddr)
 			err = s.httpServer.ListenAndServe()
 		}
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.logger.Error("http server error", "error", err)
 		}
 	}()
@@ -137,7 +141,7 @@ func (s *Server) Shutdown() error {
 	}
 
 	// Shutdown HTTP server with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		s.logger.Error("http server shutdown error", "error", err)
@@ -153,7 +157,7 @@ func (s *Server) Shutdown() error {
 	select {
 	case <-done:
 		s.logger.Info("all connections closed cleanly")
-	case <-time.After(10 * time.Second):
+	case <-time.After(shutdownTimeout):
 		s.logger.Warn("shutdown timeout, forcing exit")
 	}
 
@@ -186,7 +190,7 @@ func (s *Server) acceptLoop(serviceName string, listener net.Listener) {
 
 		// Check max connections
 		if s.config.MaxConnections > 0 {
-			current := atomic.LoadInt32(&s.activeConns)
+			current := s.activeConns.Load()
 			if current >= int32(s.config.MaxConnections) {
 				log.Warn("max connections reached, rejecting connection", "max", s.config.MaxConnections)
 				conn.Close()
@@ -208,8 +212,8 @@ func (s *Server) acceptLoop(serviceName string, listener net.Listener) {
 
 // handleDataConnection handles bidirectional data transfer.
 func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *websocket.Conn) {
-	atomic.AddInt32(&s.activeConns, 1)
-	defer atomic.AddInt32(&s.activeConns, -1)
+	s.activeConns.Add(1)
+	defer s.activeConns.Add(-1)
 	defer incoming.Close()
 	defer outgoing.Close()
 

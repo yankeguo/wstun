@@ -103,38 +103,27 @@ func FormatHandleMessage(connID string) string {
 // ParseConnectMessage extracts the connection ID from a CONNECT message.
 // Returns the connection ID and true if valid, empty string and false otherwise.
 func ParseConnectMessage(message string) (string, bool) {
-	// Validate message length to prevent excessive memory usage
-	if len(message) > maxMessageLength {
-		return "", false
-	}
-	if !strings.HasPrefix(message, MessageTypePrefixConnect) {
-		return "", false
-	}
-	connID := message[len(MessageTypePrefixConnect):]
-	if len(connID) != ulidLength {
-		return "", false
-	}
-	// Validate the ULID is well-formed
-	if !ValidateConnectionID(connID) {
-		return "", false
-	}
-	return connID, true
+	return parsePrefixedMessage(message, MessageTypePrefixConnect)
 }
 
 // ParseHandleMessage extracts the connection ID from a HANDLE message.
 // Returns the connection ID and true if valid, empty string and false otherwise.
 func ParseHandleMessage(message string) (string, bool) {
+	return parsePrefixedMessage(message, MessageTypePrefixHandle)
+}
+
+// parsePrefixedMessage extracts and validates the connection ID from a message
+// carrying the given prefix. Returns the connection ID and true if valid,
+// empty string and false otherwise.
+func parsePrefixedMessage(message, prefix string) (string, bool) {
 	// Validate message length to prevent excessive memory usage
 	if len(message) > maxMessageLength {
 		return "", false
 	}
-	if !strings.HasPrefix(message, MessageTypePrefixHandle) {
+	if !strings.HasPrefix(message, prefix) {
 		return "", false
 	}
-	connID := message[len(MessageTypePrefixHandle):]
-	if len(connID) != ulidLength {
-		return "", false
-	}
+	connID := message[len(prefix):]
 	// Validate the ULID is well-formed
 	if !ValidateConnectionID(connID) {
 		return "", false

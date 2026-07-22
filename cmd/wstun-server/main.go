@@ -40,7 +40,7 @@ func main() {
 
 	// Configure structured logger
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: wstun.ParseLogLevel(config.LogLevel),
+		Level: config.SlogLevel(),
 	}))
 
 	logger.Info("starting server",
