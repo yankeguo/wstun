@@ -3,6 +3,7 @@ package wstun
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -620,4 +621,91 @@ listen_addr: ":9093"
 			t.Error("expected error when path is a file not directory, got nil")
 		}
 	})
+}
+
+// TestClientOptions_ServiceNameEdgeCases tests edge cases in service name validation
+func TestClientOptions_ServiceNameEdgeCases(t *testing.T) {
+	tests := []struct {
+		name        string
+		serviceName string
+		shouldFail  bool
+	}{
+		{"starts_with_hyphen", "-invalid", true},
+		{"ends_with_hyphen", "invalid-", true},
+		{"whitespace_only", "   ", true},
+		{"too_long", strings.Repeat("a", 256), true},
+		{"valid_with_underscore", "valid_name", false},
+		{"valid_with_hyphen", "valid-name", false},
+		{"valid_mixed", "valid_name-123", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &ClientOptions{
+				ServerURL:    "ws://localhost:8080",
+				ServiceName:  tt.serviceName,
+				ServiceToken: "token",
+				TargetAddr:   "localhost:3000",
+			}
+
+			err := opts.Validate()
+			if tt.shouldFail && err == nil {
+				t.Errorf("Validate() should fail for service name %q", tt.serviceName)
+			}
+			if !tt.shouldFail && err != nil {
+				t.Errorf("Validate() should succeed for service name %q, but got error: %v", tt.serviceName, err)
+			}
+		})
+	}
+}
+
+// TestClientOptions_ServerURLValidation tests URL scheme validation
+func TestClientOptions_ServerURLValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		serverURL  string
+		shouldFail bool
+	}{
+		{"valid_ws", "ws://localhost:8080", false},
+		{"valid_wss", "wss://localhost:8080", false},
+		{"invalid_http", "http://localhost:8080", true},
+		{"invalid_https", "https://localhost:8080", true},
+		{"invalid_empty", "", true},
+		{"invalid_malformed", "not-a-url", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &ClientOptions{
+				ServerURL:    tt.serverURL,
+				ServiceName:  "test",
+				ServiceToken: "token",
+				TargetAddr:   "localhost:3000",
+			}
+
+			err := opts.Validate()
+			if tt.shouldFail && err == nil {
+				t.Errorf("Validate() should fail for server URL %q", tt.serverURL)
+			}
+			if !tt.shouldFail && err != nil {
+				t.Errorf("Validate() should succeed for server URL %q, but got error: %v", tt.serverURL, err)
+			}
+		})
+	}
+}
+
+// TestLoadAllServices_PathSafety tests that filepath.Join is used for safe path construction
+func TestLoadAllServices_PathSafety(t *testing.T) {
+	// This test ensures the implementation uses safe path construction
+	// The actual path traversal protection would require more complex testing
+	// with actual filesystem operations, which is beyond unit testing scope
+
+	// Test with a non-existent directory (should fail gracefully)
+	services, err := LoadAllServices("/nonexistent/directory")
+	if err == nil {
+		t.Error("LoadAllServices should fail for non-existent directory")
+	}
+	if services != nil {
+		t.Error("LoadAllServices should return nil for non-existent directory")
+	}
 }

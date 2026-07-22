@@ -30,11 +30,10 @@ wstun/
 │   ├── wstun-server/        # 服务器命令行（main.go 入口 + server.go 服务封装）
 │   └── wstun-client/        # 客户端命令行（main.go 入口 + client.go 重连逻辑）
 ├── protocol.go              # 协议常量、消息格式化/解析、ULID 校验（包文档在此文件头部）
-├── server_protocol.go       # ServerProtocol：服务器端协议处理（WebSocket 升级、认证、连接配对、重试）
-├── client_protocol.go       # ClientProtocol：客户端协议处理（控制连接、ping/pong 心跳、数据转发）
+├── server.go                # ServerProtocol：服务器端协议处理（WebSocket 升级、认证、连接配对、重试）
+├── client.go                # ClientProtocol：客户端协议处理（控制连接、ping/pong 心跳、数据转发）
 ├── config.go                # ServerOptions / ClientOptions / ServiceDefinition，YAML 加载与校验
 ├── log.go                   # ParseLogLevel：日志级别字符串到 slog.Level 的映射
-├── wstun.go                 # 仅包含 package 声明
 ├── *_test.go                # 单元测试与集成测试（均在根包 wstun 中）
 ├── examples/                # 配置示例（server.yaml、client-*.yaml、services/*.yaml）及 deploy/ 部署脚本
 ├── Dockerfile.server        # 服务器镜像（debian:13-slim + 预编译二进制）
@@ -75,7 +74,7 @@ go vet ./...
 
 - **库与 CLI 分离**：根包 `wstun` 是可复用的协议库（`ServerProtocol` / `ClientProtocol` 通过公开字段如 `DataHandler`、`ConnectHandler`、`Logger`、`PingInterval` 等注入行为）；`cmd/` 下的两个 `main` 包是薄封装，负责加载 YAML 配置、装配库组件、信号处理与优雅关闭。
 - **配置模式**：每个配置结构体都有 `Validate()` 和 `SetDefaults()` 方法；`Load*Config` 函数按「读文件 → YAML 解析 → SetDefaults → Validate」的顺序加载。新增配置字段时须同步更新这四个位置及 README 的配置表格和 `examples/` 中的注释示例。
-- **错误处理**：使用 `fmt.Errorf("...: %w", err)` 包装错误；哨兵错误（如 `ErrInvalidCredentials`）定义在 `server_protocol.go` 顶部。
+- **错误处理**：使用 `fmt.Errorf("...: %w", err)` 包装错误；哨兵错误（如 `ErrInvalidCredentials`）定义在 `server.go` 顶部。
 - **并发安全**：共享状态用 `sync.Mutex`/`RWMutex` 或 `atomic` 保护；项目强调线程安全，所有改动须通过 `go test -race`。
 - **健壮性约定**：关键 goroutine 中有 `recover()` panic 恢复；协议消息有长度上限（`maxMessageLength = 1024`）；服务名、连接 ID 等输入有严格校验。保持这些防御性检查，不要在重构中移除。
 - **数据转发细节**：处理 `Read()` 返回值时必须先处理 `n > 0` 的字节再判断 `err`（`Read` 可能同时返回数据和 `io.EOF`），否则会丢数据。
@@ -83,14 +82,14 @@ go vet ./...
 
 ## 测试策略
 
-- 所有测试位于根包 `wstun`（`*_test.go`），`cmd/` 下没有测试文件，但 `cmd_integration_test.go` 会以 `go run` / 子进程方式对两个 CLI 做集成测试（测试二进制帮助信息、缺失配置、无效配置等路径）。
-- 测试文件分工：
-  - `protocol_test.go` — 协议消息、认证、完整连接流程、并发、服务器重试逻辑
-  - `config_test.go` — 配置校验、默认值、YAML 加载
-  - `connection_health_test.go` — 控制连接健康检查、死连接清理
-  - `edge_cases_test.go` — 超长消息、非法 ULID、服务名边界、路径安全
+- 所有测试位于根包 `wstun`（`*_test.go`），`cmd/` 下没有测试文件，但 `integration_test.go` 会以 `go run` / 子进程方式对两个 CLI 做集成测试（测试二进制帮助信息、缺失配置、无效配置等路径）。
+- 测试文件分工（每个测试文件对应同名被测源文件）：
+  - `protocol_test.go` — 协议常量、ULID 生成/校验、消息格式化/解析（含超长消息、非法 ULID 等边界）
+  - `server_test.go` — 服务器端：认证、完整连接流程、并发、超时、重试逻辑、控制连接健康检查与死连接清理
+  - `client_test.go` — 客户端：BasicAuth 凭据、数据转发循环（空闲连接不误判超时）
+  - `config_test.go` — 配置校验、默认值、YAML 加载（含服务名/服务器 URL 边界、路径安全）
   - `log_test.go` — 日志级别解析
-  - `cmd_integration_test.go` — CLI 集成测试
+  - `integration_test.go` — CLI 集成测试（原 cmd_integration_test.go）
 - 新增功能须附带测试；提交前确保 `go test ./...` 与 `go test -race ./...` 全部通过、`go fmt`/`go vet` 无输出。
 
 ## CI 与部署
