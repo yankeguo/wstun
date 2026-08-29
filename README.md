@@ -123,7 +123,7 @@ max_reconnect_attempts: 0
 # 日志级别（可选，默认: "info"）
 log_level: "info"
 
-# WebSocket 心跳配置（可选）
+# WebSocket 心跳配置（可选，控制连接与数据连接均生效）
 ping_interval: 30s # Ping 发送间隔（默认: 30s）
 pong_timeout: 60s # 等待 Pong 回应超时（默认: 60s）
 write_timeout: 10s # 写操作超时（默认: 10s）
@@ -150,6 +150,8 @@ write_timeout: 10s # 写操作超时（默认: 10s）
 | `retry_attempts`     | int      | ❌   | `0`      | 连接请求最大重试次数（0 = 不重试）      |
 | `retry_interval`     | duration | ❌   | `5s`     | 初始重试间隔                            |
 | `retry_max_interval` | duration | ❌   | `60s`    | 最大重试间隔（指数退避上限）            |
+| `control_ping_interval` | duration | ❌ | `15s`    | 控制连接 Keepalive Ping 间隔（应对代理空闲超时） |
+| `write_wait`         | duration | ❌   | `10s`    | WebSocket 写操作超时时间                |
 
 ### 客户端配置
 
@@ -163,7 +165,7 @@ write_timeout: 10s # 写操作超时（默认: 10s）
 | `reconnect_interval`     | duration | ❌   | `5s`     | 重连间隔                                            |
 | `max_reconnect_attempts` | int      | ❌   | `0`      | 最大重连次数（0 = 无限制）                          |
 | `log_level`              | string   | ❌   | `"info"` | 日志级别：`debug`/`info`/`warn`/`error`             |
-| `ping_interval`          | duration | ❌   | `30s`    | WebSocket Ping 发送间隔                             |
+| `ping_interval`          | duration | ❌   | `30s`    | WebSocket Ping 发送间隔（控制连接与数据连接均生效） |
 | `pong_timeout`           | duration | ❌   | `60s`    | 等待 Pong 回应的超时时间，超时则关闭连接            |
 | `write_timeout`          | duration | ❌   | `10s`    | WebSocket 写操作超时时间                            |
 
@@ -327,9 +329,10 @@ wstun 使用双连接模型：
    - 使用文本消息（WebSocket TextMessage）
 
 2. **数据连接**（Data Connection）
-   - 短暂连接，用于实际流量传输
+   - 按需建立，用于实际流量传输，可持续任意时长（无空闲/总时长限制）
    - 客户端发送 `HANDLE:[ULID]` 认领连接
    - 使用二进制消息（WebSocket BinaryMessage）
+   - 客户端按 `ping_interval` 发送心跳，保持长连接（如 SSE）不被代理空闲超时断开
    - 连接结束后自动关闭
 
 ### 连接流程
@@ -529,7 +532,15 @@ wstun/
 - 网络不稳定，调整 `reconnect_interval`
 - 目标服务不可用，检查 `target_addr`
 - 服务器资源不足，检查 `max_connections`
-- 防火墙或代理超时，考虑添加心跳机制
+- 防火墙或代理空闲超时，缩短 `ping_interval`（客户端）和 `control_ping_interval`（服务器）
+
+### Q: 支持 SSE / 长轮询等长连接吗？会被超时断开吗？
+
+**A:** 支持。wstun 对数据连接**没有任何空闲超时或总时长限制**，连接可以持续任意时长：
+
+- 客户端会在数据连接上按 `ping_interval` 发送 WebSocket 心跳（Ping/Pong），既能穿透中间代理（Nginx、Envoy、云 LB 等）的空闲超时，也能及时发现死连接
+- 所有写超时（`write_timeout` / `write_wait`）都是**单次写操作**的截止时间，而非连接总时长限制，只在对端长时间不读取数据时才会触发
+- 若中间代理的空闲超时较短（如 Istio/Envoy 默认 60s），将 `ping_interval` 调到小于该值即可（如 `5s`）
 
 ### Q: 如何调试协议问题？
 

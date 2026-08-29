@@ -115,3 +115,155 @@ func TestTransfer_NoSpuriousReadDeadline(t *testing.T) {
 	transferA.Close()
 	<-transferDone
 }
+
+// TestTransfer_KeepaliveKeepsIdleConnectionAlive verifies that the data-connection
+// keepalive (pings + read deadline renewed by pongs) does NOT close an idle-but-alive
+// connection: with a peer that answers pings, the transfer must survive an idle gap
+// much longer than PongWait. This is the SSE/long-polling scenario.
+func TestTransfer_KeepaliveKeepsIdleConnectionAlive(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverConnCh := make(chan *websocket.Conn, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+		// Keep reading so gorilla's default ping handler answers pings with pongs.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer ts.Close()
+
+	dialer := websocket.Dialer{}
+	clientWsConn, _, err := dialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("client dial: %v", err)
+	}
+	defer clientWsConn.Close()
+
+	serverWsConn := <-serverConnCh
+
+	transferA, transferB := net.Pipe()
+	defer transferB.Close()
+
+	cp := NewClientProtocol("ws://unused", "svc", "tok")
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cp.PingInterval = 50 * time.Millisecond
+	cp.PongWait = 150 * time.Millisecond
+	cp.WriteWait = time.Second
+
+	transferDone := make(chan struct{})
+	go func() {
+		defer close(transferDone)
+		cp.transfer(clientWsConn, transferA, "test-conn-keepalive")
+	}()
+
+	// Idle for much longer than PongWait; pongs must keep the connection alive.
+	time.Sleep(400 * time.Millisecond)
+
+	select {
+	case <-transferDone:
+		t.Fatal("transfer exited during idle period despite answering peer (keepalive broken)")
+	default:
+	}
+
+	want := []byte("alive after idle with keepalive")
+	if err := serverWsConn.WriteMessage(websocket.BinaryMessage, want); err != nil {
+		t.Fatalf("WebSocket write after idle period: %v", err)
+	}
+
+	got := make([]byte, len(want))
+	transferB.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(transferB, got); err != nil {
+		t.Fatalf("data not received at target pipe after idle period: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("received %q, want %q", got, want)
+	}
+
+	clientWsConn.Close()
+	transferA.Close()
+	<-transferDone
+}
+
+// TestTransfer_KeepaliveDetectsDeadPeer verifies that a peer which stops answering
+// pings is detected and the transfer ends, instead of hanging forever.
+func TestTransfer_KeepaliveDetectsDeadPeer(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverConnCh := make(chan *websocket.Conn, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverConnCh <- conn
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer ts.Close()
+
+	dialer := websocket.Dialer{}
+	clientWsConn, _, err := dialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("client dial: %v", err)
+	}
+	defer clientWsConn.Close()
+
+	serverWsConn := <-serverConnCh
+	// Simulate a dead peer at the WebSocket layer: swallow pings, never pong.
+	serverWsConn.SetPingHandler(func(string) error { return nil })
+
+	transferA, transferB := net.Pipe()
+	defer transferB.Close()
+	defer transferA.Close()
+
+	cp := NewClientProtocol("ws://unused", "svc", "tok")
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cp.PingInterval = 50 * time.Millisecond
+	cp.PongWait = 100 * time.Millisecond
+	cp.WriteWait = time.Second
+
+	transferDone := make(chan struct{})
+	go func() {
+		defer close(transferDone)
+		cp.transfer(clientWsConn, transferA, "test-conn-dead-peer")
+	}()
+
+	// Effective read deadline is PingInterval+PongWait = 150ms; allow generous slack.
+	select {
+	case <-transferDone:
+		// Success: dead peer detected and transfer terminated.
+	case <-time.After(2 * time.Second):
+		t.Fatal("transfer did not detect dead peer within timeout")
+	}
+}
+
+// TestPingLoop_DisabledNoPanic verifies that a non-positive PingInterval disables
+// the keepalive loop instead of panicking in time.NewTicker.
+func TestPingLoop_DisabledNoPanic(t *testing.T) {
+	cp := NewClientProtocol("ws://unused", "svc", "tok")
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cp.PingInterval = 0
+
+	done := make(chan struct{})
+	cp.wg.Add(1)
+	go func() {
+		defer close(done)
+		cp.pingLoop(nil) // must return before touching the nil conn
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pingLoop did not return with PingInterval <= 0")
+	}
+}

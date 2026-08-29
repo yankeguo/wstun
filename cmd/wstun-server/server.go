@@ -30,6 +30,8 @@ type Server struct {
 	logger      *slog.Logger
 	activeConns atomic.Int32
 	shutdown    chan struct{}
+	ctx         context.Context
+	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 }
 
@@ -47,12 +49,16 @@ func NewServer(config *wstun.ServerOptions, logger *slog.Logger) (*Server, error
 
 	logger.Info("services loaded", "count", len(services), "names", getServiceNames(services))
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	server := &Server{
 		config:    config,
 		services:  services,
 		listeners: make(map[string]net.Listener),
 		logger:    logger,
 		shutdown:  make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	// Create authentication function
@@ -131,6 +137,8 @@ func (s *Server) Start() error {
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown() error {
 	close(s.shutdown)
+	// Abort any in-flight connection requests waiting for a client HANDLE.
+	s.cancel()
 
 	// Close all TCP listeners
 	s.logger.Info("closing TCP listeners")
@@ -198,15 +206,25 @@ func (s *Server) acceptLoop(serviceName string, listener net.Listener) {
 			}
 		}
 
-		// Request connection via protocol
-		connID, err := s.protocol.RequestConnection(serviceName, conn)
-		if err != nil {
-			log.Error("failed to request connection", "error", err)
-			conn.Close()
-			continue
-		}
+		// Handle each connection concurrently: RequestConnection blocks until the
+		// client claims the connection (up to PendingTimeout, plus retries), so a
+		// serialized accept loop would stall all other incoming connections and
+		// the listeners behind it.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
 
-		log.Info("connection requested", "conn_id", connID)
+			// RequestConnectionContext closes conn itself on failure.
+			connID, err := s.protocol.RequestConnectionContext(s.ctx, serviceName, conn)
+			if err != nil {
+				if s.ctx.Err() == nil {
+					log.Error("failed to request connection", "error", err)
+				}
+				return
+			}
+
+			log.Info("connection requested", "conn_id", connID)
+		}()
 	}
 }
 
@@ -214,15 +232,38 @@ func (s *Server) acceptLoop(serviceName string, listener net.Listener) {
 func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *websocket.Conn) {
 	s.activeConns.Add(1)
 	defer s.activeConns.Add(-1)
-	defer incoming.Close()
-	defer outgoing.Close()
 
 	var wg sync.WaitGroup
+	var closeIncomingOnce sync.Once
+	var closeOutgoingOnce sync.Once
+
+	closeIncoming := func() {
+		closeIncomingOnce.Do(func() {
+			incoming.Close()
+		})
+	}
+
+	closeOutgoing := func() {
+		closeOutgoingOnce.Do(func() {
+			// Best-effort close frame so the tunnel client sees a clean shutdown.
+			outgoing.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+				time.Now().Add(s.config.WriteWait))
+			outgoing.Close()
+		})
+	}
+
 	wg.Add(2)
 
 	// Incoming -> Outgoing (TCP -> WebSocket)
 	go func() {
 		defer wg.Done()
+		// When either direction ends, close both sides so the other goroutine
+		// unblocks instead of leaking on a silent peer (e.g. an SSE consumer
+		// that never sends data would otherwise keep incoming.Read blocked
+		// forever after the tunnel client disappeared).
+		defer closeIncoming()
+		defer closeOutgoing()
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error("panic in incoming->outgoing transfer", "panic", r)
@@ -235,6 +276,13 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 			// Process n bytes BEFORE checking err: Read() can return n>0 and io.EOF
 			// simultaneously on the final chunk; discarding those bytes causes data loss.
 			if n > 0 {
+				// Per-write deadline: only a peer that stops draining for longer
+				// than WriteWait is dropped; an idle-but-alive connection is not
+				// affected because the deadline is re-armed on every write.
+				if writeErr := outgoing.SetWriteDeadline(time.Now().Add(s.config.WriteWait)); writeErr != nil {
+					s.logger.Debug("failed to set write deadline", "error", writeErr)
+					return
+				}
 				if writeErr := outgoing.WriteMessage(websocket.BinaryMessage, buf[:n]); writeErr != nil {
 					s.logger.Debug("outgoing write error", "error", writeErr)
 					return
@@ -252,6 +300,8 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 	// Outgoing -> Incoming (WebSocket -> TCP)
 	go func() {
 		defer wg.Done()
+		defer closeIncoming()
+		defer closeOutgoing()
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error("panic in outgoing->incoming transfer", "panic", r)
@@ -275,6 +325,14 @@ func (s *Server) handleDataConnection(incoming io.ReadWriteCloser, outgoing *web
 				continue
 			}
 
+			// Bound writes to the external client so a stuck consumer is
+			// dropped instead of leaking the transfer goroutines forever.
+			if nc, ok := incoming.(net.Conn); ok {
+				if err := nc.SetWriteDeadline(time.Now().Add(s.config.WriteWait)); err != nil {
+					s.logger.Debug("failed to set write deadline on incoming connection", "error", err)
+					return
+				}
+			}
 			if _, err := incoming.Write(data); err != nil {
 				s.logger.Debug("incoming write error", "error", err)
 				return

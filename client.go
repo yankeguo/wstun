@@ -36,9 +36,22 @@ type ClientProtocol struct {
 	Logger         *slog.Logger
 	Dialer         *websocket.Dialer
 
+	// PingInterval is how often to send WebSocket pings, on both the control
+	// connection and every data connection (default: 30s).
+	// Setting it to <= 0 disables keepalive pings entirely; data connections
+	// then carry no read deadline, which leaves dead-peer detection to TCP
+	// keepalive alone.
 	PingInterval time.Duration
-	PongWait     time.Duration
-	WriteWait    time.Duration
+
+	// PongWait is the grace period for a pong reply before a connection is
+	// considered dead (default: 60s). On data connections the effective read
+	// deadline is PingInterval+PongWait, renewed by every pong and every
+	// message received, so an idle-but-alive tunnel (e.g. SSE with long gaps
+	// between events) is never closed.
+	PongWait time.Duration
+
+	// WriteWait is the write deadline applied to all WebSocket writes (default: 10s).
+	WriteWait time.Duration
 
 	controlConn  *websocket.Conn
 	controlMu    sync.Mutex
@@ -117,6 +130,12 @@ func (cp *ClientProtocol) Start() error {
 
 func (cp *ClientProtocol) pingLoop(conn *websocket.Conn) {
 	defer cp.wg.Done()
+
+	// PingInterval <= 0 disables keepalive; guarding here also prevents
+	// time.NewTicker from panicking on a non-positive interval.
+	if cp.PingInterval <= 0 {
+		return
+	}
 
 	ticker := time.NewTicker(cp.PingInterval)
 	defer ticker.Stop()
@@ -338,6 +357,49 @@ func (cp *ClientProtocol) handleConnectRequest(connID string) {
 func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser, connID string) {
 	log := cp.logger().With("conn_id", connID)
 
+	// Data-connection keepalive: send periodic pings and bound the read side with
+	// a deadline of PingInterval+PongWait, renewed by every pong and every message
+	// received. This keeps the tunnel leg active through proxies with idle timeouts
+	// and detects dead peers, while never closing an idle-but-alive connection
+	// (e.g. SSE with long gaps between events). Disabled when PingInterval <= 0.
+	keepaliveDone := make(chan struct{})
+	var keepaliveWg sync.WaitGroup
+	keepaliveEnabled := cp.PingInterval > 0
+	if keepaliveEnabled {
+		refreshReadDeadline := func() {
+			if err := ws.SetReadDeadline(time.Now().Add(cp.PingInterval + cp.PongWait)); err != nil {
+				log.Debug("failed to refresh read deadline", "error", err)
+			}
+		}
+		refreshReadDeadline()
+		ws.SetPongHandler(func(string) error {
+			refreshReadDeadline()
+			return nil
+		})
+		keepaliveWg.Add(1)
+		go func() {
+			defer keepaliveWg.Done()
+			ticker := time.NewTicker(cp.PingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-keepaliveDone:
+					return
+				case <-ticker.C:
+					// WriteControl is safe for concurrent use with all other methods.
+					// On failure the read deadline will fire and end the transfer.
+					if err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(cp.WriteWait)); err != nil {
+						return
+					}
+				}
+			}
+		}()
+		defer func() {
+			close(keepaliveDone)
+			keepaliveWg.Wait()
+		}()
+	}
+
 	var wg sync.WaitGroup
 	var closeChOnce sync.Once
 	var closeWSOnce sync.Once
@@ -391,6 +453,13 @@ func (cp *ClientProtocol) transfer(ws *websocket.Conn, target io.ReadWriteCloser
 					}
 				}
 				return
+			}
+
+			// Any message received also proves the peer is alive; renew the deadline.
+			if keepaliveEnabled {
+				if err := ws.SetReadDeadline(time.Now().Add(cp.PingInterval + cp.PongWait)); err != nil {
+					log.Debug("failed to refresh read deadline", "error", err)
+				}
 			}
 
 			if messageType != websocket.BinaryMessage {

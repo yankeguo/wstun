@@ -18,6 +18,10 @@ import (
 const (
 	maxReconnectDelay = 60 * time.Second
 	jitterPercent     = 0.3
+	// stableSessionDuration is how long a session must stay up for the
+	// reconnect backoff to reset: a long-lived session that drops should
+	// reconnect quickly, not resume with a backoff grown by ancient failures.
+	stableSessionDuration = time.Minute
 )
 
 // Client encapsulates the client state and operations.
@@ -78,7 +82,14 @@ func (c *Client) Run() error {
 			c.logger.Info("reconnecting to server", "attempt", attempt+1)
 		}
 
+		sessionStart := time.Now()
 		err := c.protocol.Start()
+
+		// A session that stayed up long enough was healthy: reset the backoff
+		// so a later drop reconnects promptly.
+		if time.Since(sessionStart) >= stableSessionDuration {
+			delay = c.config.ReconnectInterval
+		}
 
 		select {
 		case <-c.shutdown:

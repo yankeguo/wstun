@@ -16,8 +16,9 @@ wstun 是一个简单高效的 **TCP over WebSocket 隧道**库和命令行工�
 
 ### 协议设计（双连接模型）
 
-- **控制连接**：长连接，文本消息（TextMessage）。客户端发送 `WAITING` 表示就绪；服务器发送 `CONNECT:[ULID]` 通知有新连接。
-- **数据连接**：短连接，二进制消息（BinaryMessage）。客户端发送 `HANDLE:[ULID]` 认领连接，之后进行双向数据转发。
+- **控制连接**：长连接，文本消息（TextMessage）。客户端发送 `WAITING` 表示就绪；服务器发送 `CONNECT:[ULID]` 通知有新连接。双方均有 WebSocket Ping/Pong 心跳（服务器 `control_ping_interval`，客户端 `ping_interval`）。
+- **数据连接**：按需建立、可持续任意时长（**无空闲/总时长限制**，SSE 等长连接安全），二进制消息（BinaryMessage）。客户端发送 `HANDLE:[ULID]` 认领连接，之后进行双向数据转发。客户端在数据连接上按 `ping_interval` 发送心跳并设置读超时（`ping_interval + pong_timeout`，由 pong/消息续期），既穿透代理空闲超时又能检测死连接；`PingInterval <= 0` 时客户端完全禁用 keepalive（不设读超时）。单条数据消息上限 64 KiB（`maxDataMessageSize`，客户端转发缓冲为 32 KiB）。
+- **首消息握手**：升级后首条消息必须在 `HandshakeTimeout`（默认 10s）内到达且不超过 `maxMessageLength`（1024 字节），否则服务器关闭连接；握手完成后清除读超时。
 - 所有连接均通过 **BasicAuth** 认证（username = service_name，password = service_token）。
 - ULID 仅用于连接配对，**不是**安全机制。
 - 服务器使用单一 WebSocket 端点（`/`），路径无关。
@@ -77,7 +78,8 @@ go vet ./...
 - **错误处理**：使用 `fmt.Errorf("...: %w", err)` 包装错误；哨兵错误（如 `ErrInvalidCredentials`）定义在 `server.go` 顶部。
 - **并发安全**：共享状态用 `sync.Mutex`/`RWMutex` 或 `atomic` 保护；项目强调线程安全，所有改动须通过 `go test -race`。
 - **健壮性约定**：关键 goroutine 中有 `recover()` panic 恢复；协议消息有长度上限（`maxMessageLength = 1024`）；服务名、连接 ID 等输入有严格校验。保持这些防御性检查，不要在重构中移除。
-- **数据转发细节**：处理 `Read()` 返回值时必须先处理 `n > 0` 的字节再判断 `err`（`Read` 可能同时返回数据和 `io.EOF`），否则会丢数据。
+- **数据转发细节**：处理 `Read()` 返回值时必须先处理 `n > 0` 的字节再判断 `err`（`Read` 可能同时返回数据和 `io.EOF`），否则会丢数据。所有写超时（`WriteWait` / `WriteTimeout`）均为**单次写操作的截止时间**而非连接总时长限制，必须逐次写入前重新设置；长连接（SSE 等）不允许被空闲超时或读超时误杀。任一转发方向结束时须同时关闭两侧连接以解除另一方向 goroutine 的阻塞（客户端 `transfer` 与服务器 `handleDataConnection` 均遵循此模式）。
+- **服务器并发模型**：`acceptLoop` 为每个接入的 TCP 连接启动独立 goroutine 调用 `RequestConnectionContext`（可被 shutdown 取消）；不要让 `RequestConnection` 的阻塞等待串行化 accept 循环。
 - **注释语言**：代码注释使用英文；面向用户的文档（README）使用中文。代码注释遵循 Go doc 惯例（以符号名开头）。
 
 ## 测试策略
@@ -85,8 +87,8 @@ go vet ./...
 - 所有测试位于根包 `wstun`（`*_test.go`），`cmd/` 下没有测试文件，但 `integration_test.go` 会以 `go run` / 子进程方式对两个 CLI 做集成测试（测试二进制帮助信息、缺失配置、无效配置等路径）。
 - 测试文件分工（每个测试文件对应同名被测源文件）：
   - `protocol_test.go` — 协议常量、ULID 生成/校验、消息格式化/解析（含超长消息、非法 ULID 等边界）
-  - `server_test.go` — 服务器端：认证、完整连接流程、并发、超时、重试逻辑、控制连接健康检查与死连接清理
-  - `client_test.go` — 客户端：BasicAuth 凭据、数据转发循环（空闲连接不误判超时）
+  - `server_test.go` — 服务器端：认证、完整连接流程、并发、超时、重试逻辑、控制连接健康检查与死连接清理、首消息握手超时与长度限制、`RequestConnectionContext` 取消
+  - `client_test.go` — 客户端：BasicAuth 凭据、数据转发循环（空闲连接不误判超时）、数据连接 keepalive（保活与死连接检测）、ping 禁用防护
   - `config_test.go` — 配置校验、默认值、YAML 加载（含服务名/服务器 URL 边界、路径安全）
   - `log_test.go` — 日志级别解析
   - `integration_test.go` — CLI 集成测试（原 cmd_integration_test.go）

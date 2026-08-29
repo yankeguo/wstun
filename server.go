@@ -31,7 +31,14 @@ var (
 const (
 	defaultControlPingInterval = 15 * time.Second
 	defaultServerWriteWait     = 10 * time.Second
+	defaultHandshakeTimeout    = 10 * time.Second
 )
+
+// maxDataMessageSize bounds a single binary message on data connections.
+// The client transfer loop reads the target in 32 KiB chunks, so this
+// provides 2x headroom while preventing memory exhaustion from a peer
+// streaming an unbounded message.
+const maxDataMessageSize = 64 * 1024
 
 // ServiceAuthFunc is a function type for authenticating service credentials.
 // Returns true if the credentials are valid, false otherwise.
@@ -77,6 +84,12 @@ type ServerProtocol struct {
 	// Defaults to 10 seconds.
 	WriteWait time.Duration
 
+	// HandshakeTimeout is the deadline for reading the first message after the
+	// WebSocket upgrade (WAITING or HANDLE:[ULID]). It prevents peers that
+	// upgrade but never speak from holding connections open forever.
+	// Defaults to 10 seconds.
+	HandshakeTimeout time.Duration
+
 	// Logger for protocol events (optional, falls back to slog.Default())
 	Logger *slog.Logger
 
@@ -92,7 +105,6 @@ type ServerProtocol struct {
 type pendingConnection struct {
 	serviceName string
 	incoming    io.ReadWriteCloser
-	created     time.Time
 	cancel      context.CancelFunc
 }
 
@@ -111,6 +123,7 @@ func NewServerProtocol(authFunc ServiceAuthFunc) *ServerProtocol {
 		RetryMaxInterval:    60 * time.Second,
 		ControlPingInterval: defaultControlPingInterval,
 		WriteWait:           defaultServerWriteWait,
+		HandshakeTimeout:    defaultHandshakeTimeout,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Accept all origins; security is via BasicAuth
@@ -144,11 +157,33 @@ func (sp *ServerProtocol) HandleWebSocket(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Bound the first message in size and arrival time so that a peer which
+	// upgrades but never speaks (or streams garbage) cannot hold the
+	// connection open or exhaust memory.
+	handshakeTimeout := sp.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = defaultHandshakeTimeout
+	}
+	conn.SetReadLimit(maxMessageLength)
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		conn.Close()
+		log.Error("failed to set handshake deadline", "error", err)
+		return
+	}
+
 	// Read first text message to determine connection type
 	messageType, message, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
 		log.Error("failed to read first message", "error", err)
+		return
+	}
+
+	// Clear the handshake deadline; long-lived connections must not be killed
+	// by it. Keepalive and liveness are handled per connection type below.
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		conn.Close()
+		log.Error("failed to clear handshake deadline", "error", err)
 		return
 	}
 
@@ -210,6 +245,10 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 	log := sp.logger().With("service", serviceName, "conn_id", connID)
 	log.Info("data connection received")
 
+	// Relax the handshake read limit for binary data frames while keeping a
+	// bound against memory exhaustion.
+	conn.SetReadLimit(maxDataMessageSize)
+
 	// Atomically load and delete pending connection
 	value, loaded := sp.pendingConns.LoadAndDelete(connID)
 	if !loaded {
@@ -262,6 +301,14 @@ func (sp *ServerProtocol) handleDataConnection(conn *websocket.Conn, serviceName
 // to establish a matching data connection. Supports exponential-backoff retry when
 // RetryAttempts > 0. Closes incoming and returns an error when all attempts are exhausted.
 func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.ReadWriteCloser) (string, error) {
+	return sp.RequestConnectionContext(context.Background(), serviceName, incoming)
+}
+
+// RequestConnectionContext is like RequestConnection, but aborts promptly when
+// ctx is cancelled (e.g. during server shutdown). On cancellation incoming is
+// closed and the ctx error is returned, unless the connection was already
+// matched to a data connection, in which case success is reported.
+func (sp *ServerProtocol) RequestConnectionContext(ctx context.Context, serviceName string, incoming io.ReadWriteCloser) (string, error) {
 	log := sp.logger().With("service", serviceName)
 
 	// Generate connection ID (same ULID is reused across all retry attempts)
@@ -273,6 +320,11 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 	log = log.With("conn_id", connID)
 
 	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			incoming.Close()
+			return "", fmt.Errorf("connection request aborted: %w", err)
+		}
+
 		// Fast-fail if no control connections are registered: avoid spending PendingTimeout
 		// waiting for a HANDLE that will never come.
 		if !sp.hasControlConnections(serviceName) {
@@ -285,12 +337,12 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			continue
 		}
 
-		// Create a fresh timeout context for each attempt
-		ctx, cancel := context.WithTimeout(context.Background(), sp.PendingTimeout)
+		// Create a fresh timeout context for each attempt, derived from the
+		// caller's context so shutdown cancels the wait promptly.
+		attemptCtx, cancel := context.WithTimeout(ctx, sp.PendingTimeout)
 		pending := &pendingConnection{
 			serviceName: serviceName,
 			incoming:    incoming,
-			created:     time.Now(),
 			cancel:      cancel,
 		}
 
@@ -300,8 +352,8 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 		// here so that retry attempts can reuse the same connection.
 		timeoutChan := make(chan bool, 1)
 		go func() {
-			<-ctx.Done()
-			timedOut := ctx.Err() == context.DeadlineExceeded
+			<-attemptCtx.Done()
+			timedOut := attemptCtx.Err() == context.DeadlineExceeded
 			if timedOut {
 				sp.pendingConns.Delete(connID)
 				log.Warn("connection timeout for pending connection")
@@ -333,12 +385,22 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 		}
 
 		// Wait for the data connection handler to cancel the context (success)
-		// or for the deadline to fire (timeout / manual cancel).
+		// or for the deadline to fire (timeout / manual cancel / caller cancel).
 		timedOut := <-timeoutChan
 
 		if !timedOut && !manualCancel {
-			// Data connection was successfully matched
-			return connID, nil
+			if ctx.Err() == nil {
+				// Data connection was successfully matched
+				return connID, nil
+			}
+			// The caller's context was cancelled. If the data connection handler
+			// already claimed the pending entry, the connection is matched and
+			// owned by the handler; report success. Otherwise close incoming.
+			if _, loaded := sp.pendingConns.LoadAndDelete(connID); !loaded {
+				return connID, nil
+			}
+			incoming.Close()
+			return "", fmt.Errorf("connection request aborted: %w", ctx.Err())
 		}
 
 		// Timeout – all retry attempts used up; close the incoming connection.
@@ -357,7 +419,12 @@ func (sp *ServerProtocol) RequestConnection(serviceName string, incoming io.Read
 			}
 		}
 		log.Info("waiting before retry", "delay", retryDelay, "attempt", attempt+1, "max_attempts", sp.RetryAttempts)
-		time.Sleep(retryDelay)
+		select {
+		case <-ctx.Done():
+			incoming.Close()
+			return "", fmt.Errorf("connection request aborted: %w", ctx.Err())
+		case <-time.After(retryDelay):
+		}
 	}
 }
 

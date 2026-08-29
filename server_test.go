@@ -791,3 +791,143 @@ func TestRequestConnection_FastFailWhenSendPrunesAllConnections(t *testing.T) {
 		t.Errorf("fast-fail took %v; should be < 2s (must not block for PendingTimeout=30s)", elapsed)
 	}
 }
+
+// TestRequestConnectionContextCancel verifies that RequestConnectionContext aborts
+// promptly when its context is cancelled (e.g. server shutdown), instead of blocking
+// for the full PendingTimeout, and that it closes the incoming connection.
+func TestRequestConnectionContextCancel(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return serviceName == "test-service" && serviceToken == "test-token"
+	}
+
+	sp := NewServerProtocol(authFunc)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	sp.PendingTimeout = 30 * time.Second // long: proves the cancel path, not the timeout
+
+	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	// Control connection up, but CONNECT requests are never handled.
+	cp := NewClientProtocol(wsURL, "test-service", "test-token")
+	cp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cp.ConnectHandler = nil
+
+	go cp.Start()
+	defer cp.Stop()
+
+	// Wait for control connection
+	time.Sleep(100 * time.Millisecond)
+
+	incomingClient, incomingServer := net.Pipe()
+	defer incomingClient.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := sp.RequestConnectionContext(ctx, "test-service", incomingServer)
+		errCh <- err
+	}()
+
+	// Cancel while the request is waiting for HANDLE.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("expected error from cancelled RequestConnectionContext, got nil")
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("cancellation took too long: %v", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("RequestConnectionContext did not return after context cancellation")
+	}
+
+	// Connection should be closed
+	buf := make([]byte, 1)
+	if _, err := incomingClient.Read(buf); err == nil {
+		t.Error("expected incoming connection to be closed after cancellation")
+	}
+}
+
+// TestHandleWebSocket_FirstMessageTimeout verifies that a peer which upgrades but
+// never sends the first message is disconnected after HandshakeTimeout.
+func TestHandleWebSocket_FirstMessageTimeout(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return true
+	}
+
+	sp := NewServerProtocol(authFunc)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	sp.HandshakeTimeout = 150 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	header := http.Header{}
+	header.Set("Authorization", basicAuth("svc", "tok"))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Never send the first message; the server must close the connection.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	start := time.Now()
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			// Expected: server closed the connection.
+			if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+				t.Errorf("connection closed too early (%v), before handshake timeout", elapsed)
+			}
+			return
+		}
+	}
+}
+
+// TestHandleWebSocket_FirstMessageTooLarge verifies that an oversized first message
+// is rejected by the read limit instead of being allocated in memory.
+func TestHandleWebSocket_FirstMessageTooLarge(t *testing.T) {
+	authFunc := func(serviceName, serviceToken string) bool {
+		return true
+	}
+
+	sp := NewServerProtocol(authFunc)
+	sp.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	server := httptest.NewServer(http.HandlerFunc(sp.HandleWebSocket))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	header := http.Header{}
+	header.Set("Authorization", basicAuth("svc", "tok"))
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, make([]byte, maxMessageLength+1)); err != nil {
+		t.Fatalf("write oversized message: %v", err)
+	}
+
+	// The server must close the connection upon exceeding the read limit.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}

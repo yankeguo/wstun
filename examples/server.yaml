@@ -46,7 +46,12 @@ max_connections: 0
 # control_ping_interval: 5s
 
 # write_wait (optional, default: 10s)
-# Deadline for WebSocket write operations on the server side.
+# Deadline for individual WebSocket write operations on the server side
+# (control pings/messages, data-connection writes), and for writes to the
+# external TCP client on data connections.
+# This is a PER-WRITE deadline, not a connection lifetime limit: idle or
+# long-lived connections (e.g. SSE) are never closed by it. It only triggers
+# when the peer stops reading and the write cannot complete within write_wait.
 # The server sends a ping; if the remote end is gone and the kernel ACK never
 # arrives within write_wait, the write fails and the dead connection is pruned.
 # Examples: "5s", "10s"
