@@ -2,7 +2,7 @@
 
 一个简单高效的 WebSocket 隧道库和命令行工具，使用 Go 语言编写。
 
-[![Go Version](https://img.shields.io/badge/Go-1.25.3+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.27.4+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](.)
 [![Race Detection](https://img.shields.io/badge/race%20detection-clean-brightgreen)](.)
 
@@ -577,10 +577,10 @@ log_level: "debug"
 
 ## 技术栈
 
-- **语言**: Go 1.25.3+
+- **语言**: Go 1.27.4+
 - **依赖**:
   - `github.com/gorilla/websocket` v1.5.3 - WebSocket 实现
-  - `github.com/oklog/ulid/v2` v2.1.1 - ULID 生成
+  - `github.com/oklog/ulid/v2` v2.1.2 - ULID 生成
   - `gopkg.in/yaml.v3` v3.0.1 - YAML 解析
 
 ## 许可证

@@ -7,10 +7,10 @@
 wstun 是一个简单高效的 **TCP over WebSocket 隧道**库和命令行工具，使用 Go 语言编写。典型场景：将 NAT/防火墙后的本地 TCP 服务，通过反向 WebSocket 隧道暴露到公网服务器上。
 
 - **模块路径**：`cnb.cool/yankeguo/wstun`（托管在 cnb.cool）
-- **语言**：Go 1.25.3+
+- **语言**：Go 1.27.4+
 - **依赖**（仅 3 个外部依赖，保持最小化）：
   - `github.com/gorilla/websocket` v1.5.3 — WebSocket 实现
-  - `github.com/oklog/ulid/v2` v2.1.1 — 连接 ID（ULID）生成
+  - `github.com/oklog/ulid/v2` v2.1.2 — 连接 ID（ULID）生成
   - `gopkg.in/yaml.v3` v3.0.1 — YAML 配置解析
 - **日志**：使用标准库 `log/slog` 结构化日志（无第三方日志库）
 
@@ -37,7 +37,7 @@ wstun/
 ├── log.go                   # ParseLogLevel：日志级别字符串到 slog.Level 的映射
 ├── *_test.go                # 单元测试与集成测试（均在根包 wstun 中）
 ├── examples/                # 配置示例（server.yaml、client-*.yaml、services/*.yaml）及 deploy/ 部署脚本
-├── Dockerfile.server        # 服务器镜像（debian:13-slim + 预编译二进制）
+├── Dockerfile.server        # 服务器镜像（debian:13.7-slim + 预编译二进制）
 ├── Dockerfile.client        # 客户端镜像
 ├── wstun-client@.service    # systemd 模板单元（配置路径 /etc/wstun-client/%i.yml）
 ├── .cnb.yml                 # cnb.cool CI 流水线
@@ -96,8 +96,8 @@ go vet ./...
 
 ## CI 与部署
 
-- CI 使用 cnb.cool 流水线（`.cnb.yml`），在 `main` 分支 push 和 tag push 时触发：用 `golang:1.25.3-trixie` 镜像构建两个二进制，然后构建并推送 Docker 镜像到 cnb 仓库（tag 为 `server-<版本>` / `client-<版本>`，main 分支为 `latest`）。
-- Dockerfile 基于 `debian:13-slim`，直接将 CI 中预编译好的二进制 `ADD` 进镜像，默认启动命令为 `wstun-server -c config.yaml`（工作目录 `/wstun-server`，挂载配置到此处）。
+- CI 使用 cnb.cool 流水线（`.cnb.yml`），在 `main` 分支 push 和 tag push 时触发：用 `golang:1.27.4-trixie` 镜像构建两个二进制，然后构建并推送 Docker 镜像到 cnb 仓库（tag 为 `server-<版本>` / `client-<版本>`，main 分支为 `latest`）。
+- Dockerfile 基于 `debian:13.7-slim`，直接将 CI 中预编译好的二进制 `ADD` 进镜像，默认启动命令为 `wstun-server -c config.yaml`（工作目录 `/wstun-server`，挂载配置到此处）。
 - Linux 上可用 `wstun-client@.service` systemd 模板运行客户端实例。
 - `examples/deploy/` 中有 Kubernetes 环境的部署示例脚本（jsonnet + shell）。
 
